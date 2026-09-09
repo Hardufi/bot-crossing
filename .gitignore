@@ -18,3 +18,6 @@ assets-src
 
 # Local capture output — not part of the project.
 recordings
+
+# Local paths for docker compose (see .env.example)
+.env

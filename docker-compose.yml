@@ -1,0 +1,33 @@
+# Read-only mounts of the harness session directories, one writable volume for the map.
+#
+# Every mount is :ro on purpose. Bot Crossing never writes to a harness, and a container is
+# where that promise is cheapest to enforce rather than merely state.
+#
+# The defaults below are the macOS paths. On Windows or Linux the session directories live
+# somewhere else, so copy .env.example to .env and set them there — the container itself is
+# identical on all three, and only these four host paths differ.
+
+services:
+  bot-crossing:
+    build: .
+    ports:
+      # Loopback only. Dropping the 127.0.0.1 prefix would publish the colony to your LAN,
+      # which the API's Host/Origin check is not intended to be the last line of.
+      - "127.0.0.1:5274:5274"
+    volumes:
+      # Claude Code CLI — ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl
+      - ${BC_CLAUDE_DIR:-${HOME}/.claude}:/home/node/.claude:ro
+      # Claude Code desktop sessions. The host keeps these under "Library/Application Support"
+      # on macOS and %APPDATA% on Windows; inside the Linux container the adapter looks under
+      # $XDG_CONFIG_HOME/Claude, which the Dockerfile points at /config.
+      - ${BC_CLAUDE_DESKTOP_DIR:-${HOME}/Library/Application Support/Claude}:/config/Claude:ro
+      # Codex
+      - ${BC_CODEX_DIR:-${HOME}/.codex}:/home/node/.codex:ro
+      # Cursor
+      - ${BC_CURSOR_PROJECTS_DIR:-${HOME}/.cursor/projects}:/home/node/.cursor/projects:ro
+      # The one thing it writes.
+      - colony-data:/data
+    restart: unless-stopped
+
+volumes:
+  colony-data:

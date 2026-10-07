@@ -221,7 +221,11 @@ test('Hebrew wording', () => {
   assert.equal(L.daysText(1), 'יום\u00a0אחד')
   assert.equal(L.daysText(2), 'יומיים')
   assert.equal(L.daysText(5), '5\u00a0ימים')
+  assert.equal(L.aboutDays(1), 'כיום\u00a0אחד', 'not כיום, which means nowadays')
   assert.equal(L.aboutDays(2), 'כיומיים')
+  assert.equal(L.toDays(1), 'ליום\u00a0אחד')
+  assert.equal(L.toDays(2), 'ליומיים', 'no maqaf between a prefix and a word')
+  assert.equal(L.toDays(6), 'ל־6\u00a0ימים')
   assert.equal(L.aboutDays(9), 'כ־9\u00a0ימים')
   assert.equal(L.atHomeText(0), 'בבית מהיום')
   assert.equal(L.atHomeText(1), 'בבית מאתמול')
@@ -235,9 +239,9 @@ test('Hebrew wording', () => {
   assert.equal(on(4), 'עוד יומיים')
   assert.equal(on(5), 'עוד יום')
   assert.equal(on(6), 'יום אחרון משוער')
-  assert.equal(on(7), 'עבר את המשוער ביום')
-  assert.equal(on(8), 'עבר את המשוער ביומיים')
-  assert.equal(on(10), 'עבר את המשוער ב־4\u00a0ימים')
+  assert.equal(on(7), 'יום\u00a0אחד אחרי המשוער')
+  assert.equal(on(8), 'יומיים אחרי המשוער')
+  assert.equal(on(10), '4\u00a0ימים אחרי המשוער')
 })
 
 test('catalog: unique keys, searchable in everyday Hebrew', () => {
@@ -258,4 +262,115 @@ test('catalog: unique keys, searchable in everyday Hebrew', () => {
   assert.equal(findByName('בננות')?.key, 'banana')
   assert.equal(findByName('פיטאיה'), null)
   assert.deepEqual(inSeason(10).map((p) => p.key).slice(0, 2), ['pomegranate', 'persimmon'])
+})
+
+test('finding something spoiled after its estimate never lengthens the estimate', () => {
+  const s = stateWith(['lettuce', 10]) // estimate 5, found on day 10
+  L.answer(s, s.items[0].id, 'spoiled', T)
+  assert.equal(s.learned.lettuce, undefined)
+
+  // An item whose shelf life was raised by hand still blends from the product default.
+  const t = L.emptyState()
+  const banana = L.addItem(t, byKey('banana'), T, { boughtOn: L.addDays(T, -2), shelfLife: 14 })
+  L.answer(t, banana.id, 'spoiled', T)
+  assert.equal(t.learned.banana, 4) // (5 + 2) / 2, not (14 + 2) / 2
+})
+
+test('"still good" never shortens the estimate below the product default', () => {
+  const s = L.emptyState()
+  const tomato = L.addItem(s, byKey('tomato'), T, { boughtOn: L.addDays(T, -2), shelfLife: 2 })
+  L.answer(s, tomato.id, 'fresh', T)
+  assert.equal(tomato.shelfLife, 3, 'this batch keeps another day')
+  assert.equal(s.learned.tomato, 6, 'the catalog default stands')
+  assert.equal(L.addItem(s, byKey('tomato'), T).shelfLife, 6)
+})
+
+test('out of the freezer: the clock restarts, "eat soon" clears, and nothing is learned', () => {
+  const s = L.emptyState()
+  const item = L.addItem(s, byKey('strawberry'), T, { boughtOn: '2026-08-01', storage: 'freezer' })
+  item.useSoon = true
+  L.editItem(s, item.id, { storage: 'fridge' }, T)
+  assert.equal(item.boughtOn, T)
+  assert.equal(item.shelfLife, 3)
+  assert.equal(item.wasFrozen, true)
+  assert.equal(L.freshness(item, T).level, 'fresh')
+  assert.equal(L.isDue(item, T), false)
+
+  L.answer(s, item.id, 'fresh', L.addDays(T, 5)) // still fine two days past the estimate
+  assert.equal(s.learned.strawberry, undefined)
+  L.answer(s, item.id, 'spoiled', L.addDays(T, 6))
+  assert.equal(s.learned.strawberry, undefined)
+})
+
+test('moving to the freezer or changing the purchase date clears "eat soon"', () => {
+  const s = stateWith(['tomato', 3], ['cucumber', 3])
+  const [tomato, cucumber] = s.items
+  L.answer(s, tomato.id, 'soon', T)
+  L.answer(s, cucumber.id, 'soon', T)
+  L.editItem(s, tomato.id, { storage: 'freezer', shelfLife: 90 }, T)
+  L.editItem(s, cucumber.id, { boughtOn: T }, T)
+  assert.equal(tomato.useSoon, false)
+  assert.equal(cucumber.useSoon, false)
+  L.answer(s, tomato.id, 'fresh', L.addDays(T, 45))
+  assert.equal(tomato.nextCheckOn, L.addDays(T, 45 + L.MAX_CHECK_GAP), 'not asked daily for months')
+})
+
+test('the demo inventory leaves no trace once cleared', () => {
+  const s = L.emptyState()
+  const sample = L.addItem(s, byKey('banana'), T, { boughtOn: L.addDays(T, -2), sample: true })
+  const real = L.addItem(s, byKey('apple'), T)
+  const r = L.answer(s, sample.id, 'spoiled', T)
+  assert.equal(r.kind, 'spoiled')
+  L.addToShopping(s, sample, T)
+  L.addToShopping(s, byKey('lemon'), T)
+  assert.deepEqual(s.history, [])
+  assert.deepEqual(s.learned, {})
+  L.clearSample(s)
+  assert.deepEqual(s.items.map((i) => i.id), [real.id])
+  assert.deepEqual(s.shopping.map((x) => x.key), ['lemon'])
+})
+
+test('editItem ignores fields the sheet does not edit', () => {
+  const s = stateWith(['apple', 0])
+  const item = s.items[0]
+  L.editItem(s, item.id, { id: 'x"><b>', name: '  תפוח גאלה  ', storage: 'attic', shelfLife: 'abc' }, T)
+  assert.notEqual(item.id, 'x"><b>')
+  assert.equal(item.name, 'תפוח גאלה')
+  assert.equal(item.storage, 'fridge')
+  assert.equal(item.shelfLife, 1)
+})
+
+test('only something shaped like a backup may replace the data', () => {
+  for (const v of [123456, 'hello', [], {}, true, null, { items: 'x' }]) assert.equal(L.looksLikeBackup(v), false, JSON.stringify(v))
+  assert.equal(L.looksLikeBackup({ items: [] }), true)
+})
+
+test('normalizeState makes hostile backups harmless', () => {
+  const evil = '"><img src=x onerror=alert(1)>'
+  const s = L.normalizeState({
+    items: [
+      { id: evil, name: 'תפוח', key: 'apple', boughtOn: T, nextCheckOn: T, shelfLife: 5, color: 'red;background:url(x)', storage: evil, useSoon: 'yes', qty: 4 },
+      { id: 'same', name: 'בננה', boughtOn: T, nextCheckOn: T, shelfLife: 99999 },
+      { id: 'same', name: 'חסה', boughtOn: '2026-02-30', nextCheckOn: T, shelfLife: 5 },
+      { id: 'same', name: 'גזר', boughtOn: T, nextCheckOn: T, shelfLife: 5 },
+    ],
+    shopping: [{ id: 's1', name: 'לימון', done: evil }],
+    history: [{ id: 'h', type: evil, name: 'x', on: T }, { id: 'h2', type: 'eaten', name: 'תפוח', on: T, age: 'old' }],
+    learned: { banana: evil, apple: '9', 'name:x': -3 },
+    settings: { remindAt: evil },
+  })
+  const [apple, banana, carrot] = s.items
+  assert.equal(s.items.length, 3, 'the impossible date is dropped')
+  assert.match(apple.id, /^[a-z0-9]+$/i)
+  assert.equal(apple.color, null)
+  assert.equal(apple.storage, 'fridge')
+  assert.equal(apple.useSoon, false)
+  assert.equal(apple.qty, '4')
+  assert.equal(banana.shelfLife, 3650)
+  assert.equal(banana.id, 'same')
+  assert.notEqual(carrot.id, 'same', 'duplicate ids are replaced')
+  assert.equal(s.shopping[0].done, false)
+  assert.deepEqual(s.history.map((h) => [h.type, h.age]), [['eaten', 0]])
+  assert.deepEqual(s.learned, { apple: 9 })
+  assert.equal(s.settings.remindAt, '19:00')
 })

@@ -1,6 +1,6 @@
 import { STAPLES, STORAGE, FREEZER_DAYS, byKey, inSeason, searchCatalog, findByName } from './catalog.js'
 import * as L from './logic.js'
-import { loadLocal, localStore, openStore, deviceGet, deviceSet } from './storage.js'
+import { loadLocal, localStore, openStore, deviceGet, deviceSet, stateFromStorageEvent } from './storage.js'
 
 const TABS = ['check', 'pantry', 'shop', 'settings']
 const TAB_LABELS = { check: 'בדיקה', pantry: 'מלאי', shop: 'קניות', settings: 'הגדרות' }
@@ -18,19 +18,41 @@ document.documentElement.dir = 'rtl'
 let state = L.normalizeState(loadLocal())
 let store = localStore
 let today = L.isoDay()
-let syncedOnce = false
 let toastTimer = null
+
+// Announcements live outside #app, which is rebuilt on every render: a live region that is
+// re-created each time is announced unreliably, or over and over.
+const polite = liveRegion('status')
+const urgent = liveRegion('alert')
+
+function liveRegion(role) {
+  const el = document.createElement('div')
+  el.className = 'sr-only'
+  el.setAttribute('role', role)
+  document.body.append(el)
+  return el
+}
+
+function announce(text, region = polite) {
+  region.textContent = ''
+  setTimeout(() => {
+    region.textContent = text
+  }, 60)
+}
 
 const ui = {
   tab: initialTab(),
   sheet: null, // {type:'add', mode, query, kind} | {type:'edit', id, draft}
-  followUp: null, // {item, kind, age} after "eaten" or "spoiled"
+  followUp: null, // {item, kind, age, learnedBefore} after "eaten" or "spoiled"
+  askFirst: null, // the item "ask now" was pressed on
   toast: null, // {text, undo}
   syncError: null,
   confirmReset: false,
   restoreOpen: false,
-  copyFallback: null,
+  copyFallback: null, // {where: 'shop' | 'backup', text} when the clipboard refused
   enter: new Set(), // what animates in on the next render: 'card', 'sheet', 'toast'
+  focus: null, // a selector to focus after the next render
+  opener: null, // the control that opened the current sheet, to return focus to
 }
 
 function initialTab() {
@@ -108,6 +130,7 @@ function commit(mutate, { toast = null, undoable = true } = {}) {
 function showToast(text, undo = null) {
   ui.toast = { text, undo }
   ui.enter.add('toast')
+  announce(text)
   clearTimeout(toastTimer)
   toastTimer = setTimeout(() => {
     ui.toast = null
@@ -115,61 +138,82 @@ function showToast(text, undo = null) {
   }, 5500)
 }
 
-function adoptRemote(data) {
-  const remote = L.normalizeState(data)
-  if (!syncedOnce) {
-    syncedOnce = true
-    // Changes made on this device before the synced copy arrived (or that never reached it)
-    // win once; after that the newest copy wins.
-    if (state.updatedAt > remote.updatedAt) {
-      storeReady.then((s) => s.save(state))
-      return
-    }
+// Another device, another window, or another person's leftover cache changed the state.
+function adopt(data, why) {
+  state = data ? L.normalizeState(data) : L.emptyState()
+  if (ui.sheet?.type === 'edit' && !state.items.some((i) => i.id === ui.sheet.id)) ui.sheet = null
+  if (ui.toast) ui.toast.undo = null // undoing now would roll back the other device's changes
+  if (why === 'reset') {
+    ui.followUp = null
+    ui.toast = null
   }
-  if (data && remote.updatedAt > state.updatedAt) {
-    state = remote
-    render()
-  }
+  if (why === 'conflict') showToast('המלאי עודכן ממכשיר אחר. שינויים שנעשו כאן לפני הסנכרון לא נשמרו.')
+  render()
 }
 
-const storeReady = openStore({
-  onRemote: adoptRemote,
-  onError: (message) => {
+openStore({
+  getState: () => state,
+  adopt,
+  onStatus(message) {
+    if (message === ui.syncError) return
     ui.syncError = message
+    if (message) announce(message, urgent)
     render()
   },
 }).then((s) => {
   store = s
   if (s.kind === 'cloud' && ui.tab === 'settings') render()
-  return s
+})
+
+window.addEventListener('storage', (e) => {
+  const data = stateFromStorageEvent(e)
+  if (!data) return
+  const next = L.normalizeState(data)
+  if (next.updatedAt > state.updatedAt) adopt(next, 'newer')
 })
 
 // ---- views ---------------------------------------------------------------------------------
 
+// Every render rebuilds #app, so focus is carried across by what the focused control does.
+const FOCUS_ATTRS = ['data-act', 'data-id', 'data-key', 'data-kind', 'data-tab', 'data-delta', 'data-storage', 'data-outcome', 'data-mode', 'data-yes']
+
+function focusSelector(el) {
+  if (!el || el === document.body || !root.contains(el)) return null
+  if (el.id) return '#' + CSS.escape(el.id)
+  const parts = FOCUS_ATTRS.filter((a) => el.hasAttribute(a)).map((a) => `[${a}="${CSS.escape(el.getAttribute(a))}"]`)
+  return parts.length ? parts.join('') : null
+}
+
 function render() {
   today = L.isoDay()
   const due = L.dueItems(state, today)
-  const focusId = document.activeElement?.id
+  const active = document.activeElement
+  const hadFocus = Boolean(active && active !== document.body && root.contains(active))
+  const wanted = ui.focus ?? (hadFocus ? focusSelector(active) : null)
+  ui.focus = null
   const sheetScroll = document.querySelector('.sheet')?.scrollTop ?? 0
 
+  if (ui.sheet?.type === 'edit' && !state.items.some((i) => i.id === ui.sheet.id)) ui.sheet = null
   const views = { check: viewCheck, pantry: viewPantry, shop: viewShop, settings: viewSettings }
   const overlay = ui.sheet ? renderSheet() : ui.followUp && ui.tab !== 'check' ? renderFollowUpSheet() : ''
+  const inert = overlay ? 'inert' : ''
+  const opened = { sheet: ui.enter.has('sheet'), card: ui.enter.has('card') }
 
   root.innerHTML = `
-    <header class="mast">
+    <header class="mast" ${inert}>
       <div class="brand">
         <span class="brand-name">בתוקף</span>
         <span class="brand-sub">פירות וירקות בבית</span>
       </div>
       <time class="mast-date" datetime="${today}">${esc(new Intl.DateTimeFormat('he-IL', { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date()))}</time>
     </header>
-    ${ui.syncError ? `<p class="banner banner-warn" role="alert">${esc(ui.syncError)}</p>` : ''}
-    <main class="view" id="view-${ui.tab}">${views[ui.tab](due)}</main>
-    <nav class="tabbar" aria-label="ניווט">
+    ${ui.syncError ? `<p class="banner banner-warn" ${inert}>${esc(ui.syncError)}</p>` : ''}
+    <main class="view" id="view-${ui.tab}" ${inert}>${views[ui.tab](due)}</main>
+    <nav class="tabbar" aria-label="ניווט" ${inert}>
       ${TABS.map(
         (t) => `<button class="tab" data-act="tab" data-tab="${t}" ${t === ui.tab ? 'aria-current="page"' : ''}>
           ${icon(t)}<span>${TAB_LABELS[t]}</span>
-          ${t === 'check' && due.length ? `<b class="badge" aria-label="${due.length} מחכים לבדיקה">${due.length}</b>` : ''}
+          ${t === 'check' && due.length ? `<b class="badge" aria-label="${due.length === 1 ? 'פריט אחד מחכה לבדיקה' : `${due.length} פריטים מחכים לבדיקה`}">${due.length}</b>` : ''}
           ${t === 'shop' && openShopping().length ? `<b class="badge badge-quiet">${openShopping().length}</b>` : ''}
         </button>`,
       ).join('')}
@@ -184,7 +228,15 @@ function render() {
 
   const sheet = document.querySelector('.sheet')
   if (sheet) sheet.scrollTop = sheetScroll
-  if (focusId) document.getElementById(focusId)?.focus({ preventScroll: true })
+
+  const $ = (sel) => (sel ? root.querySelector(sel) : null)
+  let target = null
+  if (opened.sheet) target = (ui.sheet?.type === 'add' && matchMedia('(pointer: fine)').matches && $('#add-q')) || $('#sheet-title')
+  else if (opened.card && overlay) target = $('#f-name')
+  target ??= $(wanted)
+  // The control that had focus is gone (the question was answered): continue from the next card.
+  if (!target && hadFocus) target = $('#q-name') ?? $('#f-name') ?? $('main h1')
+  target?.focus({ preventScroll: true })
 }
 
 const openShopping = () => state.shopping.filter((s) => !s.done)
@@ -195,7 +247,7 @@ function viewCheck(due) {
   if (ui.followUp) return followUpCard()
   if (!state.items.length) return emptyStart()
   if (!due.length) return allDone()
-  return questionCard(due[0], due.length)
+  return questionCard(due.find((i) => i.id === ui.askFirst) ?? due[0], due.length)
 }
 
 function questionCard(item, remaining) {
@@ -208,7 +260,7 @@ function questionCard(item, remaining) {
       <div class="qcard-top">
         ${tile(item, 'tile-xl')}
         <div class="qcard-title">
-          <h1 class="qname" id="q-name">${esc(item.name)}</h1>
+          <h1 class="qname" id="q-name" tabindex="-1">${esc(item.name)}</h1>
           ${item.qty ? `<p class="qty-tag">כמות: ${esc(item.qty)}</p>` : ''}
           <p class="qmeta">${[L.atHomeText(f.age), esc(where), `הערכה: ${L.aboutDays(item.shelfLife)}`].map((t) => `<span class="nb">${t}</span>`).join(' · ')}</p>
         </div>
@@ -216,20 +268,20 @@ function questionCard(item, remaining) {
       ${dayStrip(item, f)}
       <h2 class="qask">עדיין בתוקף?</h2>
       <div class="answers">
-        <button class="ans ans-fresh" data-act="answer" data-kind="fresh" data-id="${item.id}">
+        <button class="ans ans-fresh" data-act="answer" data-kind="fresh" data-id="${esc(item.id)}">
           <span class="ans-label">במצב טוב</span><span class="ans-hint">אשאל שוב ${L.inDaysText(L.daysBetween(today, nextIfFresh))}</span>
         </button>
-        <button class="ans ans-soon" data-act="answer" data-kind="soon" data-id="${item.id}">
+        <button class="ans ans-soon" data-act="answer" data-kind="soon" data-id="${esc(item.id)}">
           <span class="ans-label">לאכול בקרוב</span><span class="ans-hint">אזכיר מחר</span>
         </button>
-        <button class="ans ans-eaten" data-act="answer" data-kind="eaten" data-id="${item.id}">
+        <button class="ans ans-eaten" data-act="answer" data-kind="eaten" data-id="${esc(item.id)}">
           <span class="ans-label">סיימנו</span><span class="ans-hint">יוצא מהמלאי</span>
         </button>
-        <button class="ans ans-spoiled" data-act="answer" data-kind="spoiled" data-id="${item.id}">
+        <button class="ans ans-spoiled" data-act="answer" data-kind="spoiled" data-id="${esc(item.id)}">
           <span class="ans-label">זרקנו</span><span class="ans-hint">אעדכן את ההערכה</span>
         </button>
       </div>
-      <button class="link-btn" data-act="answer" data-kind="later" data-id="${item.id}">דלג, שאל אותי מחר</button>
+      <button class="link-btn" data-act="answer" data-kind="later" data-id="${esc(item.id)}">לדלג ולשאול מחר</button>
     </article>`
 }
 
@@ -259,7 +311,7 @@ function dayStrip(item, f) {
 }
 
 function followUpCard(asSheet = false) {
-  const { item, kind, age } = ui.followUp
+  const { item, kind, age, learnedBefore } = ui.followUp
   const onList = openShopping().some((s) => L.sameProduct(s, item))
   let tip = ''
   if (kind === 'spoiled') {
@@ -268,7 +320,7 @@ function followUpCard(asSheet = false) {
     tip =
       times >= 2
         ? `זו הפעם ה־${times} החודש. אולי כדאי לקנות פחות בכל פעם.`
-        : learned
+        : learned && learned !== learnedBefore
           ? `עדכנתי את ההערכה: מעכשיו ${L.aboutDays(learned)}.`
           : ''
   } else if (age < item.shelfLife / 2) {
@@ -280,7 +332,7 @@ function followUpCard(asSheet = false) {
         ${tile(item, 'tile-xl')}
         <div class="qcard-title">
           <p class="eyebrow">${kind === 'eaten' ? 'סיימנו' : 'זרקנו'}</p>
-          <h1 class="qname" id="f-name">${esc(item.name)}</h1>
+          <h1 class="qname" id="f-name" tabindex="-1">${esc(item.name)}</h1>
         </div>
       </div>
       ${tip ? `<p class="tip">${esc(tip)}</p>` : ''}
@@ -336,7 +388,7 @@ function allDone() {
       ${
         eatFirst.length
           ? `<h2 class="section-label">כדאי לאכול קודם</h2>
-             <div class="chips">${eatFirst.map((i) => `<button class="chip lvl-${L.freshness(i, today).level}" data-act="edit" data-id="${i.id}">${tile(i, 'tile-sm')}${esc(i.name)}</button>`).join('')}</div>`
+             <div class="chips">${eatFirst.map((i) => `<button class="chip lvl-${L.freshness(i, today).level}" data-act="edit" data-id="${esc(i.id)}">${tile(i, 'tile-sm')}${esc(i.name)}</button>`).join('')}</div>`
           : ''
       }
       <h2 class="section-label">השאלות הבאות</h2>
@@ -386,7 +438,7 @@ function pantryRow(item) {
   const f = L.freshness(item, today)
   const due = L.isDue(item, today)
   return `<li>
-    <button class="row lvl-${f.level}" data-act="edit" data-id="${item.id}">
+    <button class="row row-pantry lvl-${f.level}" data-act="edit" data-id="${esc(item.id)}">
       ${tile(item)}
       <span class="row-main">
         <span class="row-name">${esc(item.name)}${item.qty ? ` <span class="qty">${esc(item.qty)}</span>` : ''}</span>
@@ -429,7 +481,7 @@ function viewShop() {
                   </div>`
                : ''
            }
-           ${ui.copyFallback ? `<label class="field"><span>אפשר להעתיק מכאן:</span><textarea id="copy-fallback" rows="5" readonly>${esc(ui.copyFallback)}</textarea></label>` : ''}`
+           ${copyFallback('shop')}`
         : `<p class="lede">כשמשהו נגמר או מתקלקל, אשאל אם להוסיף אותו לכאן.</p>`
     }
     ${again.length ? `<h2 class="section-label">נגמר לאחרונה</h2><div class="chips">${again.map((h) => chipAdd(h)).join('')}</div>` : ''}
@@ -438,7 +490,7 @@ function viewShop() {
 
 function shopRow(s) {
   return `<li class="shop-row ${s.done ? 'is-done' : ''}">
-    <button class="row" role="checkbox" aria-checked="${s.done}" data-act="shop-toggle" data-id="${s.id}">
+    <button class="row" role="checkbox" aria-checked="${s.done === true}" data-act="shop-toggle" data-id="${esc(s.id)}">
       <span class="box" aria-hidden="true"></span>
       ${tile(s)}
       <span class="row-main">
@@ -446,13 +498,18 @@ function shopRow(s) {
         ${s.note ? `<span class="row-sub">${esc(s.note)}</span>` : ''}
       </span>
     </button>
-    <button class="icon-btn" data-act="shop-remove" data-id="${s.id}" aria-label="הסרת ${esc(s.name)} מהרשימה">${icon('close')}</button>
+    <button class="icon-btn" data-act="shop-remove" data-id="${esc(s.id)}" aria-label="הסרת ${esc(s.name)} מהרשימה">${icon('close')}</button>
   </li>`
 }
 
 function chipAdd(p) {
   const attrs = p.key ? `data-key="${esc(p.key)}"` : `data-name="${esc(p.name)}"`
   return `<button class="chip" data-act="pick" data-mode="shop" ${attrs}>${tile(p, 'tile-sm')}${esc(p.name)}${icon('plus')}</button>`
+}
+
+function copyFallback(where) {
+  if (ui.copyFallback?.where !== where) return ''
+  return `<label class="field"><span>אפשר להעתיק מכאן:</span><textarea id="copy-fallback" rows="5" readonly dir="${where === 'backup' ? 'ltr' : 'rtl'}">${esc(ui.copyFallback.text)}</textarea></label>`
 }
 
 function shoppingText() {
@@ -463,10 +520,13 @@ function shoppingText() {
 
 function viewSettings() {
   const s = L.stats(state, today)
+  // A typed name is stored squashed (no spaces or quotes); show it as it was typed.
+  const typed = (pid) =>
+    state.history.findLast((h) => L.productId(h) === pid) ?? state.items.find((i) => L.productId(i) === pid) ?? { name: pid.slice(5) }
   const learned = Object.entries(state.learned)
     .map(([pid, days]) => {
-      const p = pid.startsWith('name:') ? { name: pid.slice(5) } : byKey(pid) ?? { name: pid }
-      return { p, days, base: p.days }
+      const p = pid.startsWith('name:') ? typed(pid) : byKey(pid) ?? { name: pid }
+      return { p, days, base: byKey(pid)?.days }
     })
     .filter((x) => x.days !== x.base)
   const notifyOn = NOTIFY_SUPPORTED && deviceGet('notify', false) && Notification.permission === 'granted'
@@ -478,7 +538,7 @@ function viewSettings() {
       <label class="field field-inline"><span>באיזו שעה לשאול?</span><input type="time" id="remind-at" value="${esc(state.settings.remindAt)}"></label>
       <p class="hint">האפליקציה שואלת כשפותחים אותה. תזכורת ביומן תדאג שתפתחו אותה כל יום בשעה הזו.</p>
       <div class="btn-row">
-        <a class="btn" href="${esc(googleCalendarUrl())}" target="_blank" rel="noopener">הוספה ליומן Google</a>
+        <a class="btn" id="gcal" href="${esc(googleCalendarUrl())}" target="_blank" rel="noopener">הוספה ליומן Google</a>
         ${TOP_LEVEL ? `<button class="btn" data-act="ics">קובץ ליומן של iPhone</button>` : ''}
       </div>
       ${
@@ -522,6 +582,7 @@ function viewSettings() {
         <button class="btn" data-act="copy-backup">העתקת גיבוי</button>
         <button class="btn" data-act="restore-open" aria-expanded="${ui.restoreOpen}">שחזור מגיבוי</button>
       </div>
+      ${copyFallback('backup')}
       ${
         ui.restoreOpen
           ? `<form class="restore" data-form="restore">
@@ -535,7 +596,7 @@ function viewSettings() {
     <section class="panel">
       <h2>מחיקת הכל</h2>
       <p class="hint">מוחק את המלאי, רשימת הקניות, ההיסטוריה ומה שנלמד.</p>
-      <button class="btn btn-danger" data-act="reset">${ui.confirmReset ? 'בטוח? לחיצה נוספת מוחקת' : 'מחיקת כל הנתונים'}</button>
+      <button class="btn btn-danger" data-act="reset">${ui.confirmReset ? 'למחוק באמת? לחיצה נוספת מוחקת' : 'מחיקת כל הנתונים'}</button>
     </section>`
 }
 
@@ -599,7 +660,7 @@ function addSheet() {
   const { mode, query, kind } = ui.sheet
   return `
     <div class="sheet-head">
-      <h2 id="sheet-title">${mode === 'shop' ? 'הוספה לרשימת הקניות' : 'הוספה למלאי'}</h2>
+      <h2 id="sheet-title" tabindex="-1">${mode === 'shop' ? 'הוספה לרשימת הקניות' : 'הוספה למלאי'}</h2>
       <button class="icon-btn" data-act="close-sheet" aria-label="סגירה">${icon('close')}</button>
     </div>
     <input class="search" id="add-q" type="text" inputmode="search" placeholder="חיפוש, או שם של משהו אחר" value="${esc(query)}" autocomplete="off" enterkeyhint="done">
@@ -642,7 +703,7 @@ function editSheet() {
   const learned = state.learned[pid]
   return `
     <div class="sheet-head">
-      <h2 id="sheet-title">${tile(item, 'tile-sm')}${esc(item.name)}</h2>
+      <h2 id="sheet-title" tabindex="-1">${tile(item, 'tile-sm')}${esc(item.name)}</h2>
       <button class="icon-btn" data-act="close-sheet" aria-label="סגירה">${icon('close')}</button>
     </div>
     <form class="edit" data-form="edit">
@@ -659,11 +720,11 @@ function editSheet() {
       <div class="field"><span>כמה ימים זה מחזיק בערך</span>
         <div class="stepper">
           <button type="button" class="icon-btn" data-act="edit-days" data-delta="1" aria-label="יום נוסף">${icon('plus')}</button>
-          <output id="e-days" aria-live="polite">${d.shelfLife}</output>
+          <output id="e-days">${d.shelfLife}</output>
           <button type="button" class="icon-btn" data-act="edit-days" data-delta="-1" aria-label="יום אחד פחות"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 12h14"/></svg></button>
         </div>
       </div>
-      ${learned && base && learned !== base ? `<p class="hint">ההערכה ההתחלתית הייתה ${L.daysText(base)}. לפי התשובות שלכם עדכנתי ל־${L.daysText(learned)}.</p>` : ''}
+      ${learned && base && learned !== base ? `<p class="hint">ההערכה ההתחלתית הייתה ${L.daysText(base)}. לפי התשובות שלכם עדכנתי ${L.toDays(learned)}.</p>` : ''}
       <p class="hint">השאלה הבאה: ${esc(whenText(item.nextCheckOn))}.</p>
       <button class="btn btn-primary wide" type="submit">שמירה</button>
     </form>
@@ -672,7 +733,7 @@ function editSheet() {
       <button class="btn" data-act="edit-out" data-outcome="spoiled">זרקנו</button>
       <button class="btn" data-act="check-now">לשאול עכשיו</button>
     </div>
-    <button class="link-btn link-danger" data-act="edit-delete">מחיקה (הוזן בטעות)</button>`
+    <button class="link-btn link-danger" data-act="edit-delete">מחיקה (טעות בהזנה)</button>`
 }
 
 function readEditForm() {
@@ -685,7 +746,7 @@ function readEditForm() {
 }
 
 function renderToast() {
-  return `<div class="toast ${ui.enter.has('toast') ? 'enter' : ''}" role="status">
+  return `<div class="toast ${ui.enter.has('toast') ? 'enter' : ''}">
     <span>${esc(ui.toast.text)}</span>
     ${ui.toast.undo ? '<button class="toast-btn" data-act="undo">ביטול</button>' : ''}
   </div>`
@@ -715,6 +776,7 @@ function addEntry(entry, mode) {
 function goTab(tab) {
   ui.tab = tab
   ui.copyFallback = null
+  ui.restoreOpen = false
   ui.confirmReset = false
   try {
     history.replaceState(null, '', '#' + tab)
@@ -734,6 +796,16 @@ async function copyText(text, done) {
   }
 }
 
+function followUpFor(item, kind) {
+  return { item, kind, age: L.freshness(item, today).age, learnedBefore: state.learned[L.productId(item)] }
+}
+
+function closeSheet() {
+  ui.sheet = null
+  ui.focus = ui.opener
+  ui.opener = null
+}
+
 const actions = {
   tab: (el) => goTab(el.dataset.tab),
 
@@ -742,7 +814,8 @@ const actions = {
     const item = state.items.find((i) => i.id === id)
     if (!item) return
     ui.enter.add('card')
-    if (kind === 'eaten' || kind === 'spoiled') ui.followUp = { item, kind, age: L.freshness(item, today).age }
+    if (ui.askFirst === id) ui.askFirst = null
+    if (kind === 'eaten' || kind === 'spoiled') ui.followUp = followUpFor(item, kind)
     commit((d) => L.answer(d, id, kind, today), { toast: `נרשם: ${item.name} · ${ANSWER_LABELS[kind]}` })
   },
 
@@ -758,10 +831,10 @@ const actions = {
 
   'open-add'(el) {
     ui.toast = null
+    ui.opener = focusSelector(el)
     ui.sheet = { type: 'add', mode: el.dataset.mode, query: '', kind: 'all' }
     ui.enter.add('sheet')
     render()
-    if (window.matchMedia('(pointer: fine)').matches) document.getElementById('add-q')?.focus()
   },
 
   'add-kind'(el) {
@@ -780,7 +853,7 @@ const actions = {
   },
 
   'close-sheet'() {
-    ui.sheet = null
+    closeSheet()
     render()
   },
 
@@ -789,6 +862,7 @@ const actions = {
     if (!item) return
     const { name, qty, storage, boughtOn, shelfLife } = item
     ui.toast = null
+    ui.opener = focusSelector(el)
     ui.sheet = { type: 'edit', id: item.id, draft: { name, qty, storage, boughtOn, shelfLife } }
     ui.enter.add('sheet')
     render()
@@ -801,7 +875,11 @@ const actions = {
     const next = el.dataset.storage
     if (next === d.storage) return
     if (next === 'freezer') d.shelfLife = FREEZER_DAYS
-    else if (d.storage === 'freezer') d.shelfLife = L.estimateDays(state, item, next)
+    else if (d.storage === 'freezer') {
+      // Thawed: the kitchen clock starts from today.
+      d.shelfLife = L.estimateDays(state, item, next)
+      d.boughtOn = today
+    }
     d.storage = next
     render()
   },
@@ -811,15 +889,17 @@ const actions = {
     const d = ui.sheet.draft
     d.shelfLife = Math.max(1, Math.min(365, d.shelfLife + Number(el.dataset.delta)))
     render()
+    announce(L.daysText(d.shelfLife))
   },
 
   'edit-out'(el) {
     const id = ui.sheet.id
     const outcome = el.dataset.outcome
     ui.sheet = null
+    ui.opener = null
     const item = state.items.find((i) => i.id === id)
     if (!item) return
-    ui.followUp = { item, kind: outcome, age: L.freshness(item, today).age }
+    ui.followUp = followUpFor(item, outcome)
     ui.enter.add('card')
     commit((d) => L.removeItem(d, id, outcome, today), { toast: `נרשם: ${item.name} · ${ANSWER_LABELS[outcome]}` })
   },
@@ -827,11 +907,14 @@ const actions = {
   'check-now'() {
     const id = ui.sheet.id
     ui.sheet = null
+    ui.opener = null
+    ui.askFirst = id
     ui.enter.add('card')
     commit((d) => {
       const i = d.items.find((x) => x.id === id)
       if (i) i.nextCheckOn = today
     }, { undoable: false })
+    ui.focus = '#q-name'
     goTab('check')
   },
 
@@ -839,6 +922,7 @@ const actions = {
     const id = ui.sheet.id
     const item = state.items.find((i) => i.id === id)
     ui.sheet = null
+    ui.opener = null
     commit((d) => L.removeItem(d, id, null, today), { toast: `נמחק מהמלאי: ${item?.name}` })
   },
 
@@ -857,7 +941,7 @@ const actions = {
   async 'copy-list'() {
     const text = shoppingText()
     if (!(await copyText(text, 'הרשימה הועתקה'))) {
-      ui.copyFallback = text
+      ui.copyFallback = { where: 'shop', text }
       render()
       document.getElementById('copy-fallback')?.select()
     }
@@ -884,12 +968,8 @@ const actions = {
   },
 
   'clear-sample'() {
-    commit(
-      (d) => {
-        d.items = d.items.filter((i) => !i.sample)
-      },
-      { toast: 'הדוגמה נוקתה' },
-    )
+    if (ui.followUp?.item.sample) ui.followUp = null
+    commit((d) => L.clearSample(d), { toast: 'הדוגמה נוקתה' })
   },
 
   ics() {
@@ -905,9 +985,10 @@ const actions = {
     const text = JSON.stringify(state)
     if (!(await copyText(text, 'הגיבוי הועתק. כדאי להדביק אותו בפתק או במייל לעצמכם.'))) {
       ui.restoreOpen = false
-      ui.copyFallback = text
-      showToast('לא הצלחתי להעתיק אוטומטית')
+      ui.copyFallback = { where: 'backup', text }
+      showToast('לא הצלחתי להעתיק אוטומטית. אפשר להעתיק מהתיבה.')
       render()
+      document.getElementById('copy-fallback')?.select()
     }
   },
 
@@ -976,10 +1057,12 @@ root.addEventListener('input', (e) => {
 
 root.addEventListener('change', async (e) => {
   const t = e.target
-  if (t.id === 'remind-at' && t.value) {
-    commit((d) => {
-      d.settings.remindAt = t.value
-    }, { toast: `התזכורת תהיה ב־${t.value}`, undoable: false })
+  // Saved in place: a full render here would rebuild the field while it is still being typed.
+  if (t.id === 'remind-at' && t.value && t.value !== state.settings.remindAt) {
+    state = { ...state, settings: { ...state.settings, remindAt: t.value }, updatedAt: Date.now() }
+    store.save(state)
+    document.getElementById('gcal')?.setAttribute('href', googleCalendarUrl())
+    announce(`התזכורת תהיה ב־${t.value}`)
   }
   if (t.id === 'notify') {
     if (t.checked && Notification.permission !== 'granted') {
@@ -994,8 +1077,9 @@ root.addEventListener('change', async (e) => {
 root.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && e.target.id === 'add-q') {
     e.preventDefault()
-    const first = document.querySelector('#add-results [data-act]')
-    first?.click()
+    // Enter (or the keyboard's Done key) on an empty search only closes the keyboard.
+    if (!ui.sheet?.query?.trim()) return
+    document.querySelector('#add-results [data-act]')?.click()
   }
 })
 
@@ -1005,7 +1089,7 @@ root.addEventListener('submit', (e) => {
   if (form === 'edit') {
     readEditForm()
     const { id, draft } = ui.sheet
-    ui.sheet = null
+    closeSheet()
     commit((d) => L.editItem(d, id, draft, today), { toast: 'נשמר' })
   }
   if (form === 'restore') {
@@ -1017,13 +1101,20 @@ root.addEventListener('submit', (e) => {
       render()
       return
     }
+    if (!L.looksLikeBackup(parsed)) {
+      showToast('זה לא נראה כמו גיבוי של בתוקף. מדביקים את כל הטקסט שהועתק.')
+      render()
+      return
+    }
     const restored = L.normalizeState(parsed)
+    const n = restored.items.length
     ui.restoreOpen = false
+    ui.followUp = null
     commit(
       (d) => {
         Object.assign(d, restored)
       },
-      { toast: `שוחזרו ${restored.items.length} פריטים במלאי` },
+      { toast: n === 1 ? 'שוחזר פריט אחד במלאי' : `שוחזרו ${n} פריטים במלאי` },
     )
   }
 })
@@ -1034,9 +1125,9 @@ window.addEventListener('hashchange', () => {
 })
 
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && (ui.sheet || ui.followUp)) {
-    if (ui.sheet) ui.sheet = null
-    else if (ui.tab !== 'check') ui.followUp = null
+  if (e.key === 'Escape' && (ui.sheet || (ui.followUp && ui.tab !== 'check'))) {
+    if (ui.sheet) closeSheet()
+    else ui.followUp = null
     render()
   }
 })
@@ -1045,11 +1136,15 @@ document.addEventListener('keydown', (e) => {
 
 async function maybeNotify() {
   if (!NOTIFY_SUPPORTED || !deviceGet('notify', false) || Notification.permission !== 'granted') return
-  if (document.visibilityState === 'visible') return
   const now = new Date()
   if (`${pad(now.getHours())}:${pad(now.getMinutes())}` < state.settings.remindAt) return
   const day = L.isoDay(now)
   if (deviceGet('notifiedOn') === day) return
+  // Having the app open after the reminder time counts as today's reminder.
+  if (document.visibilityState === 'visible') {
+    deviceSet('notifiedOn', day)
+    return
+  }
   const due = L.dueItems(state, day)
   if (!due.length) return
   deviceSet('notifiedOn', day)

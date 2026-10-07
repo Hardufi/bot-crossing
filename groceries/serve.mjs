@@ -20,7 +20,13 @@ const TYPES = {
 }
 
 createServer(async (req, res) => {
-  const path = decodeURIComponent(new URL(req.url, 'http://x').pathname)
+  let path
+  try {
+    path = decodeURIComponent(new URL(req.url, 'http://x').pathname)
+  } catch {
+    res.writeHead(400).end()
+    return
+  }
   const file = normalize(join(ROOT, path.endsWith('/') ? path + 'index.html' : path))
   if (!file.startsWith(ROOT) || file.includes(`${ROOT}test`)) {
     res.writeHead(404).end()

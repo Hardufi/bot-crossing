@@ -14,6 +14,7 @@
   --accent-soft: #ece2f2;
   --fresh: #2c7638;
   --fresh-soft: #dbefdc;
+  --on-fresh: #ffffff;
   --soon: #9c5604;
   --soon-soft: #fbe8cc;
   --over: #ad2a22;
@@ -48,6 +49,7 @@
     --accent-soft: #33283c;
     --fresh: #86d18c;
     --fresh-soft: #1d3221;
+    --on-fresh: #10240f;
     --soon: #f1b45f;
     --soon-soft: #3b2b14;
     --over: #f28d83;
@@ -70,6 +72,7 @@
   --accent-soft: #33283c;
   --fresh: #86d18c;
   --fresh-soft: #1d3221;
+  --on-fresh: #10240f;
   --soon: #f1b45f;
   --soon-soft: #3b2b14;
   --over: #f28d83;
@@ -119,6 +122,15 @@ button {
 
 [hidden] {
   display: none !important;
+}
+
+.sr-only {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 #app {
@@ -305,14 +317,15 @@ button {
 }
 
 .pill {
-  flex: none;
+  flex: 0 1 auto;
+  max-inline-size: 45%;
+  text-align: center;
   padding: 3px 10px;
   border-radius: 999px;
   background: var(--lvl-soft, var(--sunken));
   color: var(--lvl, var(--ink-soft));
   font-size: var(--step--1);
   font-weight: 700;
-  white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
 
@@ -346,9 +359,13 @@ button {
 
 .qname {
   margin: 0;
-  font: 700 var(--step-5) / 0.9 var(--font-display);
+  font: 700 clamp(2.25rem, 13vw, var(--step-5)) / 0.9 var(--font-display);
   text-wrap: balance;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
+}
+
+.qname:focus {
+  outline: none;
 }
 
 .qty-tag {
@@ -548,7 +565,8 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 5px 12px 5px 6px;
+  padding-block: 5px;
+  padding-inline: 6px 12px;
   border: 1px solid var(--line);
   border-radius: 999px;
   background: var(--surface);
@@ -614,6 +632,11 @@ button {
   border-top: 1px solid var(--line);
 }
 
+.list .row:focus-visible,
+.list .icon-btn:focus-visible {
+  outline-offset: -3px;
+}
+
 .row {
   display: flex;
   align-items: center;
@@ -629,6 +652,23 @@ button {
   display: grid;
   flex: 1;
   min-width: 0;
+}
+
+/* On the narrowest phones the status moves under the name rather than squeezing it. */
+@media (max-width: 380px) {
+  .row-pantry {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+
+  .row-pantry .row-main {
+    flex-basis: calc(100% - 52px);
+  }
+
+  .row-pantry .pill {
+    max-inline-size: none;
+    margin-inline-start: 52px;
+  }
 }
 
 .row-name {
@@ -665,10 +705,20 @@ button {
 }
 
 .is-done .box {
+  display: grid;
+  place-items: center;
   border-color: var(--fresh);
-  background: var(--fresh)
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 12.5l4 4 8-9'/%3E%3C/svg%3E")
-    center / 18px no-repeat;
+  background: var(--fresh);
+}
+
+.is-done .box::after {
+  content: '';
+  inline-size: 18px;
+  block-size: 18px;
+  background: var(--on-fresh);
+  --tick: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 12.5l4 4 8-9'/%3E%3C/svg%3E");
+  -webkit-mask: var(--tick) center / contain no-repeat;
+  mask: var(--tick) center / contain no-repeat;
 }
 
 .is-done .row-name {
@@ -828,13 +878,14 @@ button {
 }
 
 .sheet-card {
-  padding: 0 0 env(safe-area-inset-bottom, 0px);
+  padding: 0;
   background: none;
   box-shadow: none;
 }
 
 .sheet-card .qcard {
   border-radius: 22px 22px 0 0;
+  padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
 }
 
 .sheet-head {
@@ -842,6 +893,10 @@ button {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.sheet-head h2:focus {
+  outline: none;
 }
 
 .sheet-head h2 {
@@ -925,7 +980,7 @@ button {
 
 .field textarea {
   resize: vertical;
-  font: 400 var(--step--1) / 1.4 ui-monospace, Menlo, Consolas, monospace;
+  font: 400 var(--step-0) / 1.4 ui-monospace, Menlo, Consolas, monospace;
 }
 
 .field-inline {
@@ -1127,8 +1182,10 @@ button {
   font-weight: 600;
 }
 
-/* With a sheet open the bottom belongs to the sheet's buttons. */
-body.locked .toast {
+/* With a sheet open the bottom belongs to the sheet's buttons, and on the question screen to
+   the answers: the toast moves to the top there. */
+body.locked .toast,
+#view-check ~ .toast {
   bottom: auto;
   top: calc(12px + env(safe-area-inset-top, 0px));
 }

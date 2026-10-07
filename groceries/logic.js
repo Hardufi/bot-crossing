@@ -1,7 +1,7 @@
 // Everything the app decides, with no DOM in it, so it can be tested on its own.
 // Days are local calendar days written 'YYYY-MM-DD'; they compare correctly as strings.
 
-import { byKey, normalizeName, FREEZER_DAYS } from './catalog.js'
+import { byKey, normalizeName, FREEZER_DAYS, STORAGE } from './catalog.js'
 
 export const MAX_HISTORY = 400
 export const MAX_CHECK_GAP = 14
@@ -45,21 +45,103 @@ export function emptyState() {
   }
 }
 
-// Accepts anything that came out of storage or a pasted backup and returns a usable state.
+// A real calendar day: '2026-02-30' has the right shape but is not one.
+export function isDay(s) {
+  return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && addDays(s, 0) === s
+}
+
+// Whether pasted text is plausibly a backup, before it is allowed to replace everything.
+export function looksLikeBackup(raw) {
+  return Boolean(raw) && typeof raw === 'object' && !Array.isArray(raw) && Array.isArray(raw.items)
+}
+
+const MAX_DAYS = 3650
+const text = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : typeof v === 'number' && Number.isFinite(v) ? String(v) : '')
+const count = (v) => {
+  const n = Math.round(Number(v))
+  return Number.isFinite(n) && n > 0 ? Math.min(n, MAX_DAYS) : null
+}
+
+// The fields every product-shaped record carries, from a catalog key or what was typed.
+function cleanProduct(raw) {
+  const name = text(raw.name, 60)
+  if (!name) return null
+  return {
+    key: typeof raw.key === 'string' && byKey(raw.key) ? raw.key : null,
+    name,
+    emoji: typeof raw.emoji === 'string' && raw.emoji ? raw.emoji.slice(0, 16) : null,
+    color: typeof raw.color === 'string' && /^#[0-9a-f]{6}$/i.test(raw.color) ? raw.color : null,
+    kind: raw.kind === 'fruit' ? 'fruit' : 'veg',
+  }
+}
+
+// Accepts anything that came out of storage, another device or a pasted backup, and returns a
+// state the app can render safely: every field the right type, every id unique and plain.
 export function normalizeState(raw) {
   const base = emptyState()
   if (!raw || typeof raw !== 'object') return base
-  const isDay = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s)
-  const items = Array.isArray(raw.items)
-    ? raw.items.filter((i) => i && typeof i.name === 'string' && isDay(i.boughtOn) && isDay(i.nextCheckOn) && Number(i.shelfLife) > 0)
-    : []
+  const ids = new Set()
+  const cleanId = (v) => {
+    const id = typeof v === 'string' && /^[a-z0-9]{1,40}$/i.test(v) && !ids.has(v) ? v : uid() + ids.size
+    ids.add(id)
+    return id
+  }
+  const list = (v) => (Array.isArray(v) ? v.filter((x) => x && typeof x === 'object') : [])
+
+  const items = []
+  for (const i of list(raw.items)) {
+    const p = cleanProduct(i)
+    const shelfLife = count(i.shelfLife)
+    if (!p || !shelfLife || !isDay(i.boughtOn) || !isDay(i.nextCheckOn)) continue
+    const item = {
+      id: cleanId(i.id),
+      ...p,
+      storage: Object.hasOwn(STORAGE, i.storage) ? i.storage : 'fridge',
+      qty: text(i.qty, 24),
+      boughtOn: i.boughtOn,
+      shelfLife,
+      nextCheckOn: i.nextCheckOn,
+      useSoon: i.useSoon === true,
+      lastCheckedOn: isDay(i.lastCheckedOn) ? i.lastCheckedOn : null,
+    }
+    if (i.wasFrozen === true) item.wasFrozen = true
+    if (i.sample === true) item.sample = true
+    items.push(item)
+  }
+
+  const shopping = []
+  for (const s of list(raw.shopping)) {
+    const p = cleanProduct(s)
+    if (!p) continue
+    const entry = { id: cleanId(s.id), ...p, note: text(s.note, 60), addedOn: isDay(s.addedOn) ? s.addedOn : null, done: s.done === true }
+    if (s.sample === true) entry.sample = true
+    shopping.push(entry)
+  }
+
+  const history = []
+  for (const h of list(raw.history).slice(-MAX_HISTORY)) {
+    const p = cleanProduct(h)
+    if (!p || !isDay(h.on) || (h.type !== 'eaten' && h.type !== 'spoiled')) continue
+    const age = Math.round(Number(h.age))
+    history.push({ id: cleanId(h.id), type: h.type, ...p, on: h.on, age: Number.isFinite(age) && age >= 0 ? age : 0 })
+  }
+
+  const learned = {}
+  if (raw.learned && typeof raw.learned === 'object') {
+    for (const [pid, days] of Object.entries(raw.learned)) {
+      const n = count(days)
+      if (n && pid.length <= 80) learned[pid] = n
+    }
+  }
+
+  const remindAt = raw.settings?.remindAt
   return {
     ...base,
-    items: items.map((i) => ({ ...i, shelfLife: Math.round(Number(i.shelfLife)) })),
-    shopping: Array.isArray(raw.shopping) ? raw.shopping.filter((s) => s && typeof s.name === 'string') : [],
-    history: Array.isArray(raw.history) ? raw.history.filter((h) => h && isDay(h.on)).slice(-MAX_HISTORY) : [],
-    learned: raw.learned && typeof raw.learned === 'object' ? { ...raw.learned } : {},
-    settings: { ...base.settings, ...(raw.settings && typeof raw.settings === 'object' ? raw.settings : {}) },
+    items,
+    shopping,
+    history,
+    learned,
+    settings: { remindAt: typeof remindAt === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(remindAt) ? remindAt : base.settings.remindAt },
     updatedAt: Number(raw.updatedAt) || 0,
   }
 }
@@ -91,6 +173,12 @@ export function estimateDays(state, entry, storage) {
   const p = product(entry)
   if ((storage ?? p.storage) === 'freezer') return FREEZER_DAYS
   return state.learned[productId(p)] ?? p.days
+}
+
+// Only a fresh, real item says anything about how long this product keeps in the kitchen.
+// Freezer time, time in the freezer before a thaw, and the demo inventory teach nothing.
+function teaches(item) {
+  return item.storage !== 'freezer' && !item.wasFrozen && !item.sample
 }
 
 // The first question comes halfway through the expected life, never on the day of purchase.
@@ -154,10 +242,25 @@ export function addItem(state, entry, today, extra = {}) {
 export function editItem(state, id, changes, today) {
   const item = state.items.find((i) => i.id === id)
   if (!item) return null
+  const prev = { storage: item.storage, boughtOn: item.boughtOn, shelfLife: item.shelfLife }
   const before = item.boughtOn + '/' + item.shelfLife
-  Object.assign(item, changes)
-  item.shelfLife = Math.max(1, Math.round(Number(item.shelfLife) || 1))
+  if (typeof changes.name === 'string' && changes.name.trim()) item.name = changes.name.trim().slice(0, 60)
+  if (typeof changes.qty === 'string') item.qty = changes.qty.trim().slice(0, 24)
+  if (Object.hasOwn(STORAGE, changes.storage)) item.storage = changes.storage
+  if (isDay(changes.boughtOn)) item.boughtOn = changes.boughtOn
+  if (changes.shelfLife !== undefined) item.shelfLife = count(changes.shelfLife) ?? 1
   if (item.boughtOn > today) item.boughtOn = today
+
+  // Out of the freezer, the kitchen clock starts again from today.
+  const thawed = prev.storage === 'freezer' && item.storage !== 'freezer'
+  if (thawed) {
+    item.wasFrozen = true
+    if (item.boughtOn === prev.boughtOn) item.boughtOn = today
+    if (item.shelfLife === prev.shelfLife) item.shelfLife = estimateDays(state, item, item.storage)
+  }
+  // "Eat soon" belonged to the old batch or the old place.
+  if (item.boughtOn !== prev.boughtOn || (item.storage === 'freezer' && prev.storage !== 'freezer')) item.useSoon = false
+
   if (item.boughtOn + '/' + item.shelfLife !== before) {
     const earliest = item.lastCheckedOn ? addDays(item.lastCheckedOn, 1) : item.boughtOn
     const first = firstCheckOn(item.boughtOn, item.shelfLife)
@@ -178,15 +281,22 @@ export function removeItem(state, id, outcome, today) {
   if (index < 0) return null
   const [item] = state.items.splice(index, 1)
   const { age } = freshness(item, today)
-  if (outcome) remember(state, item, outcome, age, today)
-  // Something that went off teaches the app how long it really keeps. Blend rather than
-  // replace, because it was found at the check, not on the day it turned.
-  if (outcome === 'spoiled' && item.storage !== 'freezer') {
+  if (outcome && !item.sample) remember(state, item, outcome, age, today)
+  // Something that went off sooner than expected shortens the estimate. Blend rather than
+  // replace, because it was found at the check, not on the day it turned. Finding it spoiled
+  // after the estimate says nothing new, so it never lengthens it.
+  if (outcome === 'spoiled' && teaches(item)) {
     const pid = productId(item)
-    const base = state.learned[pid] ?? item.shelfLife
-    state.learned[pid] = Math.max(1, Math.round((base + age) / 2))
+    const base = state.learned[pid] ?? product(item).days
+    if (age < base) state.learned[pid] = Math.max(1, Math.round((base + age) / 2))
   }
   return item
+}
+
+// Removes the demo inventory and anything it put on the shopping list.
+export function clearSample(state) {
+  state.items = state.items.filter((i) => !i.sample)
+  state.shopping = state.shopping.filter((s) => !s.sample)
 }
 
 // The answer to "still good?". kind: fresh | soon | later | eaten | spoiled.
@@ -200,9 +310,9 @@ export function answer(state, id, kind, today) {
       // Still good past the estimate: it keeps longer than we thought, here and next time.
       if (left <= 0) {
         item.shelfLife = age + 1
-        if (item.storage !== 'freezer') {
+        if (teaches(item)) {
           const pid = productId(item)
-          state.learned[pid] = Math.max(state.learned[pid] ?? 0, age + 1)
+          state.learned[pid] = Math.max(state.learned[pid] ?? product(item).days, age + 1)
         }
       }
       item.nextCheckOn = nextCheckAfterFresh(item, today)
@@ -228,6 +338,7 @@ export function addToShopping(state, entry, today, note = '') {
   const existing = state.shopping.find((s) => !s.done && sameProduct(s, p))
   if (existing) return { entry: existing, added: false }
   const s = { id: uid(), key: p.key, name: p.name, emoji: p.emoji, color: p.color, kind: p.kind, note, addedOn: today, done: false }
+  if (entry.sample) s.sample = true
   state.shopping.push(s)
   return { entry: s, added: true }
 }
@@ -246,7 +357,7 @@ export function removeShopping(state, id) {
 export function checkout(state, today) {
   const bought = state.shopping.filter((s) => s.done)
   state.shopping = state.shopping.filter((s) => !s.done)
-  return bought.map((s) => addItem(state, s, today))
+  return bought.map((s) => addItem(state, s, today, { sample: s.sample }))
 }
 
 export function stats(state, today, days = 30) {
@@ -312,23 +423,29 @@ export function inDaysText(n) {
   return `בעוד ${daysText(n)}`
 }
 
-// "ב" or "כ" joined to a count of days: ביום, ביומיים, ב־5 ימים.
-function joined(prefix, n) {
-  if (n === 1) return prefix + 'יום'
+// A one-letter prefix joined to a count of days. The maqaf goes only before a numeral:
+// כיום אחד, ליומיים, כ־5 ימים.
+function prefixed(prefix, n) {
+  if (n === 1) return `${prefix}יום${NB}אחד`
   if (n === 2) return prefix + 'יומיים'
   return `${prefix}־${n}${NB}ימים`
 }
 
-// "About n days": כיום, כיומיים, כ־5 ימים.
+// "About n days".
 export function aboutDays(n) {
-  return joined('כ', n)
+  return prefixed('כ', n)
+}
+
+// "To n days", as in "updated to".
+export function toDays(n) {
+  return prefixed('ל', n)
 }
 
 export function statusText(item, today) {
   const { left, level } = freshness(item, today)
-  if (level === 'over') return 'עבר את המשוער ' + joined('ב', -left)
+  if (level === 'over') return `${daysText(-left)} אחרי המשוער`
   if (left === 0) return 'יום אחרון משוער'
   if (item.useSoon) return 'לאכול בקרוב'
   if (left <= 2) return 'עוד ' + (left === 1 ? 'יום' : 'יומיים')
-  return 'עוד ' + joined('כ', left)
+  return 'עוד ' + aboutDays(left)
 }

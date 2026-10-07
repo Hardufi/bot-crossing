@@ -37,11 +37,13 @@ export function loadLocal() {
   return cache.state
 }
 
-// The state another window of this app just saved, if it belongs to the same person.
+// The state another window of this app just saved, if it belongs to the same person. What
+// that window knows to be in the account is known here too.
 export function stateFromStorageEvent(e) {
   if (e.key !== LOCAL_KEY || !e.newValue) return null
   const cache = parseCache(e.newValue)
   if (!cache || cache.owner !== cacheOwner) return null
+  syncedAt = Math.max(syncedAt, cache.syncedAt)
   return cache.state
 }
 
@@ -73,6 +75,10 @@ export const localStore = { kind: 'local', save: saveLocal }
 
 const jitter = () => 1000 + Math.random() * 2000
 
+// Codes after which writing to the account cannot succeed for the rest of the visit. Anything
+// else, including codes this page does not know, is treated as a passing condition.
+const TERMINAL = new Set(['invalid_argument', 'transform_error', 'revoked', 'not_granted', 'capability_disabled', 'capability_removed'])
+
 // Resolves to a store with save(state) and a `kind` of 'local' or 'cloud'.
 //   getState()          the state on screen right now
 //   adopt(data, why)    replace it: why is 'newer' (another device moved on), 'conflict'
@@ -95,6 +101,7 @@ export async function openStore({ getState, adopt, onStatus }) {
   if (cacheOwner && cacheOwner !== uid) {
     cacheOwner = uid
     syncedAt = 0
+    saveLocal(null)
     adopt(null, 'reset')
   }
   cacheOwner = uid
@@ -130,6 +137,8 @@ export async function openStore({ getState, adopt, onStatus }) {
     if (!pending || dead || !ready) return
     const body = pending
     pending = null
+    // Another window or device moved the state on since this was queued, and sends its own.
+    if (body.updatedAt < getState().updatedAt) return
     chain = chain
       .then(() => ref.set(body))
       .then(() => {
@@ -143,8 +152,15 @@ export async function openStore({ getState, adopt, onStatus }) {
       })
       .catch((e) => {
         const code = e?.code
-        if (code === 'unavailable' || code === 'resource_exhausted') {
-          // Retry once after a short pause, unless a newer change is already queued.
+        if (TERMINAL.has(code)) {
+          goLocal('אין אפשרות לשמור בחשבון. השינויים נשמרים במכשיר הזה בלבד.')
+        } else if (code === 'quota_exceeded') {
+          failing = true
+          onStatus('אין מקום לשמור עוד בחשבון. השינויים נשמרו במכשיר הזה.')
+        } else {
+          // Superseded while in flight: the newer state is on its way or already there.
+          if (body.updatedAt < getState().updatedAt) return
+          // Retry once after a short pause, unless something newer is already queued.
           if (!retried && !pending) {
             retried = true
             pending = body
@@ -154,11 +170,6 @@ export async function openStore({ getState, adopt, onStatus }) {
           retried = false
           failing = true
           onStatus('השמירה בחשבון נכשלה. השינויים נשמרו במכשיר הזה, ואנסה שוב בשינוי הבא.')
-        } else if (code === 'quota_exceeded') {
-          failing = true
-          onStatus('אין מקום לשמור עוד בחשבון. השינויים נשמרו במכשיר הזה.')
-        } else {
-          goLocal('אין אפשרות לשמור בחשבון. השינויים נשמרים במכשיר הזה בלבד.')
         }
       })
   }
@@ -166,6 +177,7 @@ export async function openStore({ getState, adopt, onStatus }) {
   // The account copy just replaced what is on screen: anything queued is older than it.
   function take(remote, why) {
     pending = null
+    retried = false
     clearTimeout(timer)
     syncedAt = Number(remote.updatedAt) || 0
     saveLocal(remote)
@@ -190,6 +202,7 @@ export async function openStore({ getState, adopt, onStatus }) {
           flush()
         }
       } else if (remoteAt === local.updatedAt) {
+        pending = null
         syncedAt = remoteAt
         saveLocal(local)
       } else if (unsynced && remoteAt <= syncedAt) {
@@ -202,14 +215,20 @@ export async function openStore({ getState, adopt, onStatus }) {
       return
     }
     if (remote && remoteAt > local.updatedAt) take(remote, 'newer')
+    else if (remote && remoteAt === local.updatedAt && remoteAt > syncedAt) {
+      // Another window's write of what is on screen landed: this device is in sync up to it.
+      syncedAt = remoteAt
+      saveLocal(local)
+    }
   }
 
   function subscribe() {
     ref.onSnapshot(onSnapshot, (e) => {
       if (dead) return
-      // A bridge that stopped answering recovers only through a fresh subscription.
-      if (e?.code === 'unavailable') setTimeout(subscribe, jitter())
-      else goLocal('הסנכרון נעצר. השינויים נשמרים במכשיר הזה בלבד.')
+      if (TERMINAL.has(e?.code) || e?.code === 'resource_exhausted') goLocal('הסנכרון נעצר. השינויים נשמרים במכשיר הזה בלבד.')
+      // A bridge that stopped answering, or an unknown condition, recovers only through a
+      // fresh subscription.
+      else setTimeout(subscribe, jitter())
     })
   }
   subscribe()

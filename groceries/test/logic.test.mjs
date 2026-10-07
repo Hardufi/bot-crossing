@@ -374,3 +374,34 @@ test('normalizeState makes hostile backups harmless', () => {
   assert.deepEqual(s.learned, { apple: 9 })
   assert.equal(s.settings.remindAt, '19:00')
 })
+
+test('a demo entry on the shopping list becomes real once it is really wanted or bought', () => {
+  const s = L.emptyState()
+  const demo = L.addItem(s, byKey('banana'), T, { sample: true })
+  L.answer(s, demo.id, 'eaten', T)
+  L.addToShopping(s, demo, T)
+  L.addToShopping(s, byKey('lemon'), T)
+  const demoLemon = L.addItem(s, byKey('apple'), T, { sample: true })
+  L.addToShopping(s, demoLemon, T)
+  assert.deepEqual(s.shopping.map((x) => [x.key, x.sample === true]), [['banana', true], ['lemon', false], ['apple', true]])
+
+  // Asking for the banana for real keeps one entry and makes it real.
+  assert.equal(L.addToShopping(s, byKey('banana'), T).added, false)
+  assert.equal(s.shopping[0].sample, undefined)
+
+  // Whatever is ticked and checked out was really bought.
+  s.shopping.forEach((x) => (x.done = true))
+  const bought = L.checkout(s, T)
+  assert.ok(bought.every((i) => !i.sample))
+  L.clearSample(s)
+  assert.deepEqual(s.items.map((i) => i.key).sort(), ['apple', 'banana', 'lemon'])
+})
+
+test('names are capped where they come in, so a reload never changes a product', () => {
+  const s = L.emptyState()
+  const long = 'א'.repeat(80)
+  const item = L.addItem(s, { name: '  ' + long + '  ' }, T)
+  assert.equal(item.name.length, 60)
+  const again = L.normalizeState(JSON.parse(JSON.stringify(s)))
+  assert.equal(L.productId(again.items[0]), L.productId(item))
+})

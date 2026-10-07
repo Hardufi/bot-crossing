@@ -49,6 +49,7 @@ const ui = {
   syncError: null,
   confirmReset: false,
   restoreOpen: false,
+  restoreText: null, // what has been pasted into the restore box so far
   copyFallback: null, // {where: 'shop' | 'backup', text} when the clipboard refused
   enter: new Set(), // what animates in on the next render: 'card', 'sheet', 'toast'
   focus: null, // a selector to focus after the next render
@@ -229,13 +230,16 @@ function render() {
   const sheet = document.querySelector('.sheet')
   if (sheet) sheet.scrollTop = sheetScroll
 
-  const $ = (sel) => (sel ? root.querySelector(sel) : null)
+  // Focus may only land on something usable: not a backdrop, nothing behind an open sheet.
+  const usable = (el) => !el.closest('[inert]') && !el.matches('.sheet-backdrop') && el.matches('a, button, input, textarea, select, [tabindex]')
+  const find = (sel) => (sel ? ([...root.querySelectorAll(sel)].find(usable) ?? null) : null)
   let target = null
-  if (opened.sheet) target = (ui.sheet?.type === 'add' && matchMedia('(pointer: fine)').matches && $('#add-q')) || $('#sheet-title')
-  else if (opened.card && overlay) target = $('#f-name')
-  target ??= $(wanted)
-  // The control that had focus is gone (the question was answered): continue from the next card.
-  if (!target && hadFocus) target = $('#q-name') ?? $('#f-name') ?? $('main h1')
+  if (opened.sheet) target = (ui.sheet?.type === 'add' && matchMedia('(pointer: fine)').matches && find('#add-q')) || find('#sheet-title')
+  else if (opened.card && overlay) target = find('#f-name')
+  target ??= find(wanted)
+  // The control that had focus is gone (the question was answered, the row removed): carry on
+  // from the nearest heading, inside the sheet when one is open.
+  if (!target && hadFocus) target = overlay ? (find('.sheet #add-q') ?? find('.sheet [tabindex="-1"]')) : (find('#q-name') ?? find('#f-name') ?? find('main h1'))
   target?.focus({ preventScroll: true })
 }
 
@@ -360,7 +364,7 @@ function renderFollowUpSheet() {
 function emptyStart() {
   return `
     <section class="empty">
-      <h1 class="empty-title">מה יש בבית?</h1>
+      <h1 class="empty-title" tabindex="-1">מה יש בבית?</h1>
       <p class="lede">מוסיפים את הפירות והירקות שקניתם. כשמגיע הזמן אשאל אם הם עדיין בתוקף, ומה שנגמר או התקלקל יעבור לרשימת הקניות.</p>
       <h2 class="section-label">הוספה מהירה</h2>
       <div class="pick-grid">${STAPLES.map((k) => pickTile(byKey(k), 'pantry')).join('')}</div>
@@ -383,7 +387,7 @@ function allDone() {
   const eatFirst = state.items.filter((i) => L.freshness(i, today).level !== 'fresh').sort(L.byUrgency(today))
   return `
     <section class="done">
-      <h1 class="done-title">הכל נבדק להיום</h1>
+      <h1 class="done-title" tabindex="-1">הכל נבדק להיום</h1>
       <p class="lede">אשאל שוב כשיגיע הזמן של כל פריט.</p>
       ${
         eatFirst.length
@@ -415,11 +419,11 @@ function viewPantry() {
   const items = [...state.items].sort(L.byUrgency(today))
   const first = items.filter((i) => L.freshness(i, today).level !== 'fresh')
   const fresh = items.filter((i) => L.freshness(i, today).level === 'fresh')
-  const hasSample = state.items.some((i) => i.sample)
+  const hasSample = state.items.some((i) => i.sample) || state.shopping.some((s) => s.sample)
   return `
     <div class="view-head">
       <div>
-        <h1 class="view-title">מלאי</h1>
+        <h1 class="view-title" tabindex="-1">מלאי</h1>
         <p class="view-sub">${items.length ? `${countText(items.length, 'פריט אחד', 'פריטים')}${first.length ? ` · ${first.length} לאכול קודם` : ''}` : 'ריק כרגע'}</p>
       </div>
       <button class="btn btn-primary" data-act="open-add" data-mode="pantry">${icon('plus')}הוספה</button>
@@ -464,11 +468,12 @@ function viewShop() {
   return `
     <div class="view-head">
       <div>
-        <h1 class="view-title">קניות</h1>
+        <h1 class="view-title" tabindex="-1">קניות</h1>
         <p class="view-sub">${!list.length ? 'הרשימה ריקה' : open.length ? `${countText(open.length, 'פריט אחד', 'פריטים')} ברשימה${inCart.length ? ` · ${inCart.length} בעגלה` : ''}` : 'הכל בעגלה'}</p>
       </div>
       <button class="btn btn-primary" data-act="open-add" data-mode="shop">${icon('plus')}הוספה</button>
     </div>
+    ${state.shopping.some((s) => s.sample) ? `<p class="banner">חלק מהרשימה בא מהמלאי לדוגמה. <button class="link-btn" data-act="clear-sample">ניקוי הדוגמה</button></p>` : ''}
     ${
       list.length
         ? `<ul class="list">${list.map(shopRow).join('')}</ul>
@@ -531,7 +536,7 @@ function viewSettings() {
     .filter((x) => x.days !== x.base)
   const notifyOn = NOTIFY_SUPPORTED && deviceGet('notify', false) && Notification.permission === 'granted'
   return `
-    <h1 class="view-title">הגדרות</h1>
+    <h1 class="view-title" tabindex="-1">הגדרות</h1>
 
     <section class="panel">
       <h2>תזכורת יומית</h2>
@@ -586,7 +591,7 @@ function viewSettings() {
       ${
         ui.restoreOpen
           ? `<form class="restore" data-form="restore">
-               <label class="field"><span>מדביקים כאן את הגיבוי:</span><textarea id="restore-text" rows="4" dir="ltr"></textarea></label>
+               <label class="field"><span>מדביקים כאן את הגיבוי:</span><textarea id="restore-text" rows="4" dir="ltr">${esc(ui.restoreText ?? '')}</textarea></label>
                <button class="btn btn-primary" type="submit">שחזור</button>
              </form>`
           : ''
@@ -663,7 +668,7 @@ function addSheet() {
       <h2 id="sheet-title" tabindex="-1">${mode === 'shop' ? 'הוספה לרשימת הקניות' : 'הוספה למלאי'}</h2>
       <button class="icon-btn" data-act="close-sheet" aria-label="סגירה">${icon('close')}</button>
     </div>
-    <input class="search" id="add-q" type="text" inputmode="search" placeholder="חיפוש, או שם של משהו אחר" value="${esc(query)}" autocomplete="off" enterkeyhint="done">
+    <input class="search" id="add-q" type="text" inputmode="search" maxlength="60" placeholder="חיפוש, או שם של משהו אחר" value="${esc(query)}" autocomplete="off" enterkeyhint="done">
     <div class="seg" role="group" aria-label="סינון">
       ${[
         ['all', 'הכל'],
@@ -707,7 +712,7 @@ function editSheet() {
       <button class="icon-btn" data-act="close-sheet" aria-label="סגירה">${icon('close')}</button>
     </div>
     <form class="edit" data-form="edit">
-      <label class="field"><span>שם</span><input id="e-name" value="${esc(d.name)}" required maxlength="40"></label>
+      <label class="field"><span>שם</span><input id="e-name" value="${esc(d.name)}" required maxlength="60"></label>
       <label class="field"><span>כמות</span><input id="e-qty" value="${esc(d.qty)}" placeholder="למשל 6, חצי קילו" maxlength="24"></label>
       <div class="field"><span>איפה זה שמור</span>
         <div class="seg" role="group" aria-label="מקום">
@@ -766,6 +771,8 @@ function addEntry(entry, mode) {
   if (mode !== 'shop') {
     commit((d) => L.addItem(d, entry, today), { toast: `נוסף למלאי: ${entry.name}` })
   } else if (openShopping().some((s) => L.sameProduct(s, entry))) {
+    // Asking for it for real makes a demo entry a real one.
+    if (openShopping().some((s) => s.sample && L.sameProduct(s, entry))) commit((d) => L.addToShopping(d, entry, today), { undoable: false })
     showToast(`כבר ברשימה: ${entry.name}`)
     render()
   } else {
@@ -874,11 +881,15 @@ const actions = {
     const item = state.items.find((i) => i.id === ui.sheet.id)
     const next = el.dataset.storage
     if (next === d.storage) return
-    if (next === 'freezer') d.shelfLife = FREEZER_DAYS
-    else if (d.storage === 'freezer') {
-      // Thawed: the kitchen clock starts from today.
+    if (next === item.storage) {
+      // Back where it is saved: undo what the other choice changed.
+      d.shelfLife = item.shelfLife
+      d.boughtOn = item.boughtOn
+    } else if (next === 'freezer') d.shelfLife = FREEZER_DAYS
+    else if (item.storage === 'freezer' || d.storage === 'freezer') {
       d.shelfLife = L.estimateDays(state, item, next)
-      d.boughtOn = today
+      // Thawed: the kitchen clock starts from today.
+      if (item.storage === 'freezer') d.boughtOn = today
     }
     d.storage = next
     render()
@@ -1049,6 +1060,9 @@ root.addEventListener('click', (e) => {
 })
 
 root.addEventListener('input', (e) => {
+  // What is typed lives in ui state, so a render from another window or device keeps it.
+  if (e.target.closest?.('[data-form="edit"]')) readEditForm()
+  if (e.target.id === 'restore-text') ui.restoreText = e.target.value
   if (e.target.id === 'add-q' && ui.sheet?.type === 'add') {
     ui.sheet.query = e.target.value
     document.getElementById('add-results').innerHTML = pickResults()
@@ -1061,6 +1075,8 @@ root.addEventListener('change', async (e) => {
   if (t.id === 'remind-at' && t.value && t.value !== state.settings.remindAt) {
     state = { ...state, settings: { ...state.settings, remindAt: t.value }, updatedAt: Date.now() }
     store.save(state)
+    // An undo still on screen must not quietly bring the old time back.
+    if (ui.toast?.undo) ui.toast.undo = { ...ui.toast.undo, settings: { ...ui.toast.undo.settings, remindAt: t.value } }
     document.getElementById('gcal')?.setAttribute('href', googleCalendarUrl())
     announce(`התזכורת תהיה ב־${t.value}`)
   }
@@ -1109,6 +1125,7 @@ root.addEventListener('submit', (e) => {
     const restored = L.normalizeState(parsed)
     const n = restored.items.length
     ui.restoreOpen = false
+    ui.restoreText = null
     ui.followUp = null
     commit(
       (d) => {

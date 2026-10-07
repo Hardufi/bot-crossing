@@ -160,7 +160,7 @@ export function product(entry) {
   const known = byKey(entry.key) ?? null
   return {
     key: known?.key ?? null,
-    name: entry.name || known?.name || '',
+    name: String(entry.name || known?.name || '').trim().slice(0, 60),
     emoji: entry.emoji ?? known?.emoji ?? null,
     color: entry.color ?? known?.color ?? null,
     kind: entry.kind ?? known?.kind ?? 'veg',
@@ -336,7 +336,10 @@ export function answer(state, id, kind, today) {
 export function addToShopping(state, entry, today, note = '') {
   const p = product(entry)
   const existing = state.shopping.find((s) => !s.done && sameProduct(s, p))
-  if (existing) return { entry: existing, added: false }
+  if (existing) {
+    if (!entry.sample) delete existing.sample
+    return { entry: existing, added: false }
+  }
   const s = { id: uid(), key: p.key, name: p.name, emoji: p.emoji, color: p.color, kind: p.kind, note, addedOn: today, done: false }
   if (entry.sample) s.sample = true
   state.shopping.push(s)
@@ -353,11 +356,12 @@ export function removeShopping(state, id) {
   state.shopping = state.shopping.filter((s) => s.id !== id)
 }
 
-// Everything ticked off on the shopping list goes into the inventory as bought today.
+// Everything ticked off on the shopping list goes into the inventory as bought today. It was
+// really bought, so it is never a demo item, whatever put it on the list.
 export function checkout(state, today) {
   const bought = state.shopping.filter((s) => s.done)
   state.shopping = state.shopping.filter((s) => !s.done)
-  return bought.map((s) => addItem(state, s, today, { sample: s.sample }))
+  return bought.map((s) => addItem(state, s, today))
 }
 
 export function stats(state, today, days = 30) {

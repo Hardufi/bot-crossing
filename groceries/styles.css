@@ -340,6 +340,7 @@ button {
 
 .qcard {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 18px;
   padding: 20px;
   border-radius: 22px;
@@ -364,7 +365,10 @@ button {
   overflow-wrap: break-word;
 }
 
-.qname:focus {
+.qname:focus,
+.view-title:focus,
+.empty-title:focus,
+.done-title:focus {
   outline: none;
 }
 

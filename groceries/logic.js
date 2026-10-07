@@ -61,6 +61,8 @@ export function looksLikeBackup(raw) {
 
 const MAX_DAYS = 3650
 const MAX_PRICE = 100000
+// Keys a pasted backup could use to reach Object.prototype through a plain object.
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 const text = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : typeof v === 'number' && Number.isFinite(v) ? String(v) : '')
 const count = (v) => {
   const n = Math.round(Number(v))
@@ -148,12 +150,18 @@ export function normalizeState(raw) {
   const prices = {}
   if (raw.prices && typeof raw.prices === 'object') {
     for (const [pid, byVendor] of Object.entries(raw.prices)) {
-      if (pid.length > 80 || !byVendor || typeof byVendor !== 'object') continue
+      if (UNSAFE_KEYS.has(pid) || pid.length > 80 || !byVendor || typeof byVendor !== 'object') continue
       for (const [vid, r] of Object.entries(byVendor)) {
         const amount = parseAmount(r?.amount)
         const unit = cleanUnit(r?.unit)
         if (!vendorOf(vid) || !amount || !unit || !isDay(r.on)) continue
-        ;(prices[pid] ??= {})[vid] = { amount, unit, on: r.on, prev: parseAmount(r.prev) }
+        const record = { amount, unit, on: r.on, prev: parseAmount(r.prev) }
+        // A typed product keeps its name and kind with its prices, for when no item is left.
+        if (pid.startsWith('name:')) {
+          const p = cleanProduct({ name: r.name, kind: r.kind, cat: r.cat })
+          if (p) Object.assign(record, { name: p.name, kind: p.kind, cat: p.cat })
+        }
+        ;(prices[pid] ??= {})[vid] = record
       }
     }
   }
@@ -179,7 +187,7 @@ export function normalizeState(raw) {
   if (raw.learned && typeof raw.learned === 'object') {
     for (const [pid, days] of Object.entries(raw.learned)) {
       const n = count(days)
-      if (n && pid.length <= 80) learned[pid] = n
+      if (n && pid.length <= 80 && !UNSAFE_KEYS.has(pid)) learned[pid] = n
     }
   }
 
@@ -220,7 +228,8 @@ export function product(entry) {
     kind: entry.kind ?? known?.kind ?? 'veg',
     cat: entry.cat ?? known?.cat ?? null,
     unit: entry.unit ?? known?.unit ?? 'kg',
-    days: entry.days ?? known?.days ?? 7,
+    // Something typed rather than picked: raw meat keeps a couple of days, the rest about a week.
+    days: entry.days ?? known?.days ?? ((entry.kind === 'meat' && entry.cat !== 'processed') ? 2 : 7),
     storage: entry.storage ?? known?.storage ?? 'fridge',
   }
 }
@@ -316,6 +325,8 @@ export function editItem(state, id, changes, today) {
   const thawed = prev.storage === 'freezer' && item.storage !== 'freezer'
   if (thawed) {
     item.wasFrozen = true
+    // A thaw is not a purchase: never ask what an old freezer item cost as today's shopping.
+    if (daysBetween(prev.boughtOn, today) > PRICE_WINDOW) item.priceAsked = true
     if (item.boughtOn === prev.boughtOn) item.boughtOn = today
     if (item.shelfLife === prev.shelfLife) item.shelfLife = estimateDays(state, item, item.storage)
   }
@@ -524,9 +535,23 @@ export function recordPurchase(state, itemId, { vendorId = null, amount = null, 
   const old = byVendor[item.vendorId]
   if (!old || item.boughtOn >= old.on) {
     const prev = old && old.unit === u ? (old.on === item.boughtOn ? old.prev : old.amount) : null
-    byVendor[item.vendorId] = { amount: value, unit: u, on: item.boughtOn, prev }
+    const record = { amount: value, unit: u, on: item.boughtOn, prev }
+    if (!item.key) Object.assign(record, { name: item.name, kind: item.kind, cat: item.cat ?? null })
+    byVendor[item.vendorId] = record
   }
   return item
+}
+
+// Takes back what one purchase put in the price table, when that purchase is corrected: a
+// different store, a different price or date, or no price after all. The store goes back to
+// its previous price, or loses the entry if there was none.
+export function withdrawPurchase(state, pid, { vendorId, amount, unit, on }) {
+  const byVendor = state.prices[pid]
+  const e = byVendor?.[vendorId]
+  if (!e || e.on !== on || e.amount !== amount || e.unit !== unit) return
+  if (e.prev != null) byVendor[vendorId] = { ...e, amount: e.prev, prev: null }
+  else delete byVendor[vendorId]
+  if (!Object.keys(byVendor).length) delete state.prices[pid]
 }
 
 // Marks items as asked without recording anything ("I don't remember").
@@ -551,7 +576,8 @@ export function cheapest(state, entry) {
   if (!list.length) return null
   const unit = list[0].unit
   const same = list.filter((r) => r.unit === unit)
-  return { ...same[0], stores: same.length }
+  // A tie is not a cheapest store.
+  return { ...same[0], stores: same.length, tie: same.length > 1 && same[1].amount === same[0].amount }
 }
 
 // For a shopping list: the store that is cheapest for the most items, among items with prices
@@ -561,12 +587,14 @@ export function bestStore(state, entries) {
   let compared = 0
   for (const e of entries) {
     const c = cheapest(state, e)
-    if (!c || c.stores < 2) continue
+    if (!c || c.stores < 2 || c.tie) continue
     compared++
     wins.set(c.vendorId, (wins.get(c.vendorId) ?? 0) + 1)
   }
   if (!compared) return null
-  const [vendorId, count] = [...wins].sort((a, b) => b[1] - a[1])[0]
+  const sorted = [...wins].sort((a, b) => b[1] - a[1])
+  if (sorted[1] && sorted[1][1] === sorted[0][1]) return null // no single best store
+  const [vendorId, count] = sorted[0]
   return { vendorId, vendor: vendorName(state, vendorId), wins: count, compared }
 }
 
@@ -632,9 +660,13 @@ export function priceText(amount, unit) {
   return `${money(amount)}${NB}${UNITS[unit] ?? ''}`.trim()
 }
 
-// "at <store>": ב joined to the name, absorbing a leading ה (השוק → בשוק).
+// "at <store>". The suggested places with an article read naturally only one way each; any
+// other Hebrew name takes ב as it is (a leading ה may be part of the name: היפר כהן), and a
+// name in another script takes ב־.
+const AT_PLACE = { השוק: 'בשוק', הקצב: 'אצל הקצב', הירקן: 'אצל הירקן' }
+
 export function atVendor(name) {
-  if (/^ה[\u05d0-\u05ea]/.test(name)) return 'ב' + name.slice(1)
+  if (Object.hasOwn(AT_PLACE, name)) return AT_PLACE[name]
   if (/^[\u05d0-\u05ea]/.test(name)) return 'ב' + name
   return 'ב־' + name
 }

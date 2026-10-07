@@ -553,3 +553,90 @@ test('normalizeState keeps stores and prices consistent and safe', () => {
   assert.equal(d.cat, 'chicken')
   assert.deepEqual(s.prices, { tomato: { v1: { amount: 7.9, unit: 'kg', on: T, prev: null } } })
 })
+
+test('correcting a purchase takes back what it put in the price table', () => {
+  const s = L.emptyState()
+  const rami = L.addVendor(s, 'רמי לוי')
+  const shuf = L.addVendor(s, 'שופרסל')
+  const old = L.addItem(s, byKey('tomato'), T, { boughtOn: L.addDays(T, -7) })
+  L.recordPurchase(s, old.id, { vendorId: rami.id, amount: 6.9 })
+  const t = L.addItem(s, byKey('tomato'), T)
+  L.recordPurchase(s, t.id, { vendorId: rami.id, amount: 7.9 }) // the wrong store was preselected
+  assert.deepEqual(s.prices.tomato[rami.id], { amount: 7.9, unit: 'kg', on: T, prev: 6.9 })
+
+  L.withdrawPurchase(s, 'tomato', { vendorId: rami.id, amount: 7.9, unit: 'kg', on: T })
+  assert.deepEqual(s.prices.tomato[rami.id], { amount: 6.9, unit: 'kg', on: T, prev: null }, 'back to its real price, no made-up trend')
+  t.vendorId = null
+  L.recordPurchase(s, t.id, { vendorId: shuf.id, amount: 7.9 })
+  assert.equal(s.prices.tomato[shuf.id].amount, 7.9)
+
+  // A store with no earlier price loses the entry; an empty product disappears.
+  L.withdrawPurchase(s, 'tomato', { vendorId: shuf.id, amount: 7.9, unit: 'kg', on: T })
+  assert.equal(s.prices.tomato[shuf.id], undefined)
+  L.withdrawPurchase(s, 'tomato', { vendorId: rami.id, amount: 6.9, unit: 'kg', on: T })
+  assert.equal(s.prices.tomato, undefined)
+  // Something else's record is never touched.
+  L.recordPurchase(s, old.id, { vendorId: rami.id, amount: 6.9 })
+  L.withdrawPurchase(s, 'tomato', { vendorId: rami.id, amount: 5, unit: 'kg', on: old.boughtOn })
+  assert.equal(s.prices.tomato[rami.id].amount, 6.9)
+})
+
+test('thawing an old freezer item never asks what it cost as today\'s shopping', () => {
+  const s = L.normalizeState({
+    items: [{ id: 'a', name: 'תותים', key: 'strawberry', boughtOn: L.addDays(T, -40), nextCheckOn: T, shelfLife: 90, storage: 'freezer' }],
+  })
+  assert.equal(L.priceQuestion(s, T), null)
+  L.editItem(s, 'a', { storage: 'fridge', boughtOn: T }, T) // the sheet sends today's date on thaw
+  assert.equal(s.items[0].boughtOn, T)
+  assert.equal(L.priceQuestion(s, T), null)
+})
+
+test('meat typed by name keeps like meat', () => {
+  const s = L.emptyState()
+  assert.equal(L.addItem(s, { name: 'לבבות עוף', kind: 'meat', cat: 'chicken' }, T).shelfLife, 2)
+  assert.equal(L.addItem(s, { name: 'נקניק ציד', kind: 'meat', cat: 'processed' }, T).shelfLife, 7)
+  assert.equal(L.addItem(s, { name: 'פיטאיה', kind: 'fruit' }, T).shelfLife, 7)
+})
+
+test('equal prices are a tie, not a cheapest store', () => {
+  const s = L.emptyState()
+  const a = L.addVendor(s, 'א')
+  const b = L.addVendor(s, 'ב')
+  for (const [key, vendor, amount] of [['tomato', a, 12], ['tomato', b, 12], ['cucumber', a, 5], ['cucumber', b, 6], ['banana', a, 9], ['banana', b, 8]]) {
+    const i = L.addItem(s, byKey(key), T)
+    L.recordPurchase(s, i.id, { vendorId: vendor.id, amount })
+  }
+  assert.equal(L.cheapest(s, byKey('tomato')).tie, true)
+  assert.equal(L.cheapest(s, byKey('cucumber')).tie, false)
+  // cucumber goes to א, banana to ב, tomato is a tie: no single best store.
+  assert.equal(L.bestStore(s, ['tomato', 'cucumber', 'banana'].map(byKey)), null)
+  assert.equal(L.bestStore(s, ['tomato', 'cucumber'].map(byKey)).vendor, 'א')
+})
+
+test('"at <store>" reads right for the suggested places and for names starting with ה', () => {
+  assert.equal(L.atVendor('השוק'), 'בשוק')
+  assert.equal(L.atVendor('הקצב'), 'אצל הקצב')
+  assert.equal(L.atVendor('הירקן'), 'אצל הירקן')
+  assert.equal(L.atVendor('היפר כהן'), 'בהיפר כהן')
+  assert.equal(L.atVendor('רמי לוי'), 'ברמי לוי')
+  assert.equal(L.atVendor('AM:PM'), 'ב־AM:PM')
+})
+
+test('a typed product\'s prices keep its name and kind after the item is gone', () => {
+  const s = L.emptyState()
+  const v = L.addVendor(s, 'הקצב')
+  const i = L.addItem(s, { name: 'לבבות עוף', kind: 'meat', cat: 'chicken' }, T)
+  L.recordPurchase(s, i.id, { vendorId: v.id, amount: 29.9 })
+  L.removeItem(s, i.id, null, T)
+  const again = L.normalizeState(JSON.parse(JSON.stringify(s)))
+  const rec = again.prices['name:לבבותעוף'][v.id]
+  assert.deepEqual([rec.name, rec.kind, rec.cat], ['לבבות עוף', 'meat', 'chicken'])
+})
+
+test('a backup cannot reach Object.prototype through prices or learned', () => {
+  const raw = JSON.parse('{"vendors":[{"id":"v1","name":"א"}],"prices":{"__proto__":{"v1":{"amount":5,"unit":"kg","on":"' + T + '"}}},"learned":{"__proto__":3}}')
+  const s = L.normalizeState(raw)
+  assert.equal({}.v1, undefined)
+  assert.equal(Object.keys(s.prices).length, 0)
+  assert.equal(Object.getPrototypeOf(s.learned), Object.prototype)
+})

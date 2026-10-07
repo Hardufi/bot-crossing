@@ -264,7 +264,8 @@ function viewCheck(due, askPrice) {
   if (ui.followUp) return followUpCard()
   if (!state.items.length) return emptyStart()
   // What the latest shopping cost comes first: it is quick, and memory of it fades fastest.
-  if (askPrice && !ui.receiptIds) return receiptCard(askPrice.items, askPrice.on)
+  const askedFor = ui.askFirst && due.some((i) => i.id === ui.askFirst)
+  if (askPrice && !ui.receiptIds && !askedFor) return receiptCard(askPrice.items, askPrice.on)
   if (!due.length) return allDone()
   return questionCard(due.find((i) => i.id === ui.askFirst) ?? due[0], due.length)
 }
@@ -384,11 +385,22 @@ function receiptItems() {
 
 // The answers being typed survive renders; a new shopping day keeps what was already typed.
 function receiptDraft() {
-  if (!ui.receipt) {
-    const last = state.settings.lastVendorId
-    ui.receipt = { vendorId: state.vendors.some((v) => v.id === last) ? last : null, newVendor: '', amounts: {}, units: {}, error: null }
+  ui.receipt ??= { vendorId: undefined, newVendor: '', amounts: {}, units: {}, error: null }
+  const r = ui.receipt
+  // Start from the last store used; never keep one that has since been deleted.
+  if (r.vendorId === undefined) r.vendorId = state.settings.lastVendorId
+  if (r.vendorId && !state.vendors.some((v) => v.id === r.vendorId)) r.vendorId = null
+  return r
+}
+
+// After a receipt is answered, the answers typed for other days stay, the store choice does not.
+function clearReceipt(ids) {
+  if (!ui.receipt) return
+  for (const id of ids) {
+    delete ui.receipt.amounts[id]
+    delete ui.receipt.units[id]
   }
-  return ui.receipt
+  Object.assign(ui.receipt, { vendorId: undefined, newVendor: '', error: null })
 }
 
 function receiptCard(items, on) {
@@ -413,7 +425,7 @@ function receiptCard(items, on) {
         <span class="row-name">${esc(item.name)}${item.qty ? ` <span class="qty">${esc(item.qty)}</span>` : ''}</span>
         ${hint ? `<span class="row-sub">${esc(hint)}</span>` : ''}
       </span>
-      ${priceInput('rp-' + item.id, r.amounts[item.id] ?? '', unit, 'receipt-unit', item, `כמה עלה ${item.name}`)}
+      ${priceInput('rp-' + item.id, r.amounts[item.id] ?? '', unit, 'receipt-unit', item, `המחיר של ${item.name}`)}
     </li>`
   })
   return `
@@ -469,14 +481,17 @@ function trend(r) {
 function priceRows(entry, title = '') {
   const list = L.pricesFor(state, entry)
   if (!list.length) return ''
-  const best = new Map()
-  for (const r of list) if (!best.has(r.unit)) best.set(r.unit, r.vendorId)
-  const many = (unit) => list.filter((r) => r.unit === unit).length > 1
+  // The cheapest in each unit is marked only when it is strictly cheaper than the next store.
+  const best = new Set()
+  for (const unit of new Set(list.map((r) => r.unit))) {
+    const same = list.filter((r) => r.unit === unit)
+    if (same.length > 1 && same[0].amount < same[1].amount) best.add(same[0].vendorId + '/' + unit)
+  }
   return `${title ? `<h3 class="section-label">${esc(title)}</h3>` : ''}
     <ul class="price-rows">${list
       .map(
         (r) => `<li>
-          <span class="price-vendor">${esc(r.vendor)}${many(r.unit) && best.get(r.unit) === r.vendorId ? ' <b class="price-best">הכי זול</b>' : ''}</span>
+          <span class="price-vendor">${esc(r.vendor)}${best.has(r.vendorId + '/' + r.unit) ? ' <b class="price-best">הכי זול</b>' : ''}</span>
           <span class="price-amount">${L.priceText(r.amount, r.unit)}</span>
           ${trend(r)}
           <span class="price-date">${shortDate(r.on)}</span>
@@ -485,20 +500,24 @@ function priceRows(entry, title = '') {
       .join('')}</ul>`
 }
 
-// The item sheet's store and price, applied inside the same commit as the other edits.
-function savePriceEdit(d, id, draft) {
+// The item sheet's store and price, applied in the same commit as the other edits. `before` is
+// the item as it was: a corrected purchase first takes back what it put in the price table.
+function savePriceEdit(d, id, draft, before) {
   const item = d.items.find((i) => i.id === id)
   if (!item) return
   const vendorId = draft.vendorId || null
   const amount = L.parseAmount(draft.amount)
-  const vendorChanged = vendorId !== (item.vendorId ?? null)
-  const priceChanged = (amount ?? null) !== (item.price?.amount ?? null) || (amount !== null && draft.unit !== item.price?.unit)
-  if (vendorChanged) {
-    item.vendorId = vendorId
-    item.priceAsked = true
+  const vendorChanged = vendorId !== (before.vendorId ?? null)
+  const priceChanged = (amount ?? null) !== (before.price?.amount ?? null) || (amount !== null && draft.unit !== before.price?.unit)
+  const dateChanged = item.boughtOn !== before.boughtOn
+  if (!vendorChanged && !priceChanged && !(dateChanged && before.price)) return
+  if (before.vendorId && before.price) {
+    L.withdrawPurchase(d, L.productId(before), { vendorId: before.vendorId, amount: before.price.amount, unit: before.price.unit, on: before.boughtOn })
   }
-  if (amount === null && priceChanged) item.price = null
-  else if (amount !== null && (priceChanged || vendorChanged)) L.recordPurchase(d, id, { vendorId, amount, unit: draft.unit })
+  item.vendorId = vendorId
+  item.priceAsked = true
+  if (amount === null) item.price = null
+  else L.recordPurchase(d, id, { vendorId, amount, unit: draft.unit })
 }
 
 function emptyStart() {
@@ -650,7 +669,12 @@ function shopRow(s) {
 
 function shopSub(s) {
   const c = L.cheapest(state, s)
-  const parts = [s.note, c ? `${c.stores > 1 ? 'הכי זול' : 'מחיר אחרון'}: ${L.priceText(c.amount, c.unit)} ${L.atVendor(c.vendor)}` : ''].filter(Boolean)
+  const price = !c
+    ? ''
+    : c.tie
+      ? `אותו מחיר בכמה חנויות: ${L.priceText(c.amount, c.unit)}`
+      : `${c.stores > 1 ? 'הכי זול' : 'מחיר אחרון'}: ${L.priceText(c.amount, c.unit)} ${L.atVendor(c.vendor)}`
+  const parts = [s.note, price].filter(Boolean)
   return parts.length ? `<span class="row-sub">${esc(parts.join(' · '))}</span>` : ''
 }
 
@@ -683,7 +707,8 @@ function shoppingText() {
 function productFor(pid) {
   if (!pid.startsWith('name:')) return byKey(pid)
   const same = (x) => L.productId(x) === pid
-  return state.items.find(same) ?? state.shopping.find(same) ?? state.history.findLast(same) ?? { name: pid.slice(5), kind: 'veg' }
+  const recorded = Object.values(state.prices[pid] ?? {}).find((r) => r.name)
+  return state.items.find(same) ?? state.shopping.find(same) ?? state.history.findLast(same) ?? recorded ?? { name: pid.slice(5), kind: 'veg' }
 }
 
 function viewPrices() {
@@ -691,6 +716,7 @@ function viewPrices() {
     .map((pid) => productFor(pid))
     .filter((p) => p && L.pricesFor(state, p).length)
   const kinds = Object.keys(KINDS).filter((k) => products.some((p) => p.kind === k))
+  if (!kinds.includes(ui.pricesKind)) ui.pricesKind = 'all' // the filtered kind lost its last price
   const shown = products.filter((p) => ui.pricesKind === 'all' || p.kind === ui.pricesKind)
   const counts = new Map()
   for (const byVendor of Object.values(state.prices)) for (const vid of Object.keys(byVendor)) counts.set(vid, (counts.get(vid) ?? 0) + 1)
@@ -979,7 +1005,7 @@ function editSheet() {
           </select>
           ${priceInput('e-price', d.amount, d.unit, 'edit-unit', item, 'מחיר')}
         </div>
-        ${state.vendors.length ? '' : '<span class="hint">חנויות מוסיפים בלשונית "מחירים", או כשאני שואל כמה עלתה קנייה.</span>'}
+        ${state.vendors.length ? '' : '<span class="hint">חנויות מוסיפים בלשונית "מחירים", או כשאשאל כמה עלתה קנייה.</span>'}
       </div>
       ${priceRows(item, 'מחירים אחרונים')}
       ${learned && base && learned !== base ? `<p class="hint">ההערכה ההתחלתית הייתה ${L.daysText(base)}. לפי התשובות שלכם עדכנתי ${L.toDays(learned)}.</p>` : ''}
@@ -1237,8 +1263,9 @@ const actions = {
       return
     }
     const priced = answers.filter((a) => a.text).length
-    ui.receipt = null
+    clearReceipt(items.map((i) => i.id))
     ui.receiptIds = null
+    ui.focus = 'main h1' // the next question, never the next receipt's save button
     ui.enter.add('card')
     commit(
       (d) => {
@@ -1255,8 +1282,9 @@ const actions = {
 
   'receipt-skip'() {
     const ids = receiptItems().map((i) => i.id)
-    ui.receipt = null
+    clearReceipt(ids)
     ui.receiptIds = null
+    ui.focus = 'main h1'
     ui.enter.add('card')
     commit((d) => L.skipPrices(d, ids), { toast: 'בסדר, בלי מחירים הפעם' })
   },
@@ -1298,7 +1326,7 @@ const actions = {
     ui.enter.add('card')
     const bought = commit((d) => L.checkout(d, today), { toast: `${countText(n, 'פריט אחד עבר', 'פריטים עברו')} למלאי` })
     ui.receiptIds = bought.map((i) => i.id)
-    ui.receipt = null
+    clearReceipt([])
     ui.enter.add('card')
     render()
   },
@@ -1481,13 +1509,20 @@ root.addEventListener('submit', (e) => {
     }
     closeSheet()
     commit((d) => {
+      const before = structuredClone(d.items.find((i) => i.id === id))
       L.editItem(d, id, draft, today)
-      savePriceEdit(d, id, draft)
+      if (before) savePriceEdit(d, id, draft, before)
     }, { toast: 'נשמר' })
   }
   if (form === 'vendor-add') {
     const name = document.getElementById('v-new')?.value.trim()
     if (!name) return
+    const existing = state.vendors.find((v) => normalizeName(v.name) === normalizeName(name))
+    if (existing) {
+      showToast(`${existing.name} כבר ברשימת החנויות`)
+      render()
+      return
+    }
     commit((d) => L.addVendor(d, name), { toast: `נוספה חנות: ${name}` })
     document.getElementById('v-new')?.focus()
   }

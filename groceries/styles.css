@@ -1222,6 +1222,11 @@ button {
   font-size: var(--step-1);
 }
 
+.price-card-title > span:not(.price-cat) {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .price-cat {
   margin-inline-start: auto;
   color: var(--ink-soft);
@@ -1253,6 +1258,7 @@ button {
 
 .vendor-count {
   margin-inline-start: auto;
+  white-space: nowrap;
   color: var(--ink-soft);
   font-size: var(--step--1);
 }

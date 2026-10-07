@@ -1,9 +1,9 @@
-import { STAPLES, STORAGE, FREEZER_DAYS, byKey, inSeason, searchCatalog, findByName } from './catalog.js'
+import { STAPLES, STORAGE, FREEZER_DAYS, KINDS, MEAT_CATS, VENDOR_SUGGESTIONS, byKey, inSeason, searchCatalog, findByName, normalizeName } from './catalog.js'
 import * as L from './logic.js'
 import { loadLocal, localStore, openStore, deviceGet, deviceSet, stateFromStorageEvent } from './storage.js'
 
-const TABS = ['check', 'pantry', 'shop', 'settings']
-const TAB_LABELS = { check: 'בדיקה', pantry: 'מלאי', shop: 'קניות', settings: 'הגדרות' }
+const TABS = ['check', 'pantry', 'shop', 'prices', 'settings']
+const TAB_LABELS = { check: 'בדיקה', pantry: 'מלאי', shop: 'קניות', prices: 'מחירים', settings: 'הגדרות' }
 const ANSWER_LABELS = { fresh: 'במצב טוב', soon: 'לאכול בקרוב', later: 'נדחה למחר', eaten: 'סיימנו', spoiled: 'זרקנו' }
 const LETTER_COLORS = ['#5c8a43', '#b8323a', '#d4691c', '#7a3b69', '#8a5a2b', '#3f7f7a']
 
@@ -50,6 +50,9 @@ const ui = {
   confirmReset: false,
   restoreOpen: false,
   restoreText: null, // what has been pasted into the restore box so far
+  receipt: null, // the "how much was it?" answers being typed: {key, vendorId, newVendor, amounts, units, error}
+  receiptIds: null, // items just checked out, asked about in a sheet
+  pricesKind: 'all',
   copyFallback: null, // {where: 'shop' | 'backup', text} when the clipboard refused
   enter: new Set(), // what animates in on the next render: 'card', 'sheet', 'toast'
   focus: null, // a selector to focus after the next render
@@ -104,6 +107,7 @@ const icons = {
   pantry: '<rect x="6" y="3" width="12" height="18" rx="2.5"/><path d="M6 10h12M9.5 6v2M9.5 13v3"/>',
   shop: '<path d="M3.5 9.5h17l-1.6 9.2a2 2 0 0 1-2 1.7H7.1a2 2 0 0 1-2-1.7z"/><path d="M8.5 9.5 12 4l3.5 5.5M9.5 13v4M14.5 13v4"/>',
   settings: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
+  prices: '<path d="M3.5 12.2V4.5a1 1 0 0 1 1-1h7.7l8.3 8.3-8.7 8.7z"/><circle cx="8" cy="8" r="1.6"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   close: '<path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/>',
 }
@@ -176,7 +180,7 @@ window.addEventListener('storage', (e) => {
 // ---- views ---------------------------------------------------------------------------------
 
 // Every render rebuilds #app, so focus is carried across by what the focused control does.
-const FOCUS_ATTRS = ['data-act', 'data-id', 'data-key', 'data-kind', 'data-tab', 'data-delta', 'data-storage', 'data-outcome', 'data-mode', 'data-yes']
+const FOCUS_ATTRS = ['data-act', 'data-id', 'data-key', 'data-kind', 'data-cat', 'data-tab', 'data-delta', 'data-storage', 'data-outcome', 'data-mode', 'data-yes', 'data-vendor', 'data-new', 'data-name', 'data-unit']
 
 function focusSelector(el) {
   if (!el || el === document.body || !root.contains(el)) return null
@@ -188,6 +192,8 @@ function focusSelector(el) {
 function render() {
   today = L.isoDay()
   const due = L.dueItems(state, today)
+  const askPrice = L.priceQuestion(state, today)
+  const waiting = due.length + (askPrice ? 1 : 0)
   const active = document.activeElement
   const hadFocus = Boolean(active && active !== document.body && root.contains(active))
   const wanted = ui.focus ?? (hadFocus ? focusSelector(active) : null)
@@ -195,8 +201,15 @@ function render() {
   const sheetScroll = document.querySelector('.sheet')?.scrollTop ?? 0
 
   if (ui.sheet?.type === 'edit' && !state.items.some((i) => i.id === ui.sheet.id)) ui.sheet = null
-  const views = { check: viewCheck, pantry: viewPantry, shop: viewShop, settings: viewSettings }
-  const overlay = ui.sheet ? renderSheet() : ui.followUp && ui.tab !== 'check' ? renderFollowUpSheet() : ''
+  const views = { check: viewCheck, pantry: viewPantry, shop: viewShop, prices: viewPrices, settings: viewSettings }
+  if (ui.receiptIds && !receiptItems().length) ui.receiptIds = null
+  const overlay = ui.sheet
+    ? renderSheet()
+    : ui.followUp && ui.tab !== 'check'
+      ? renderFollowUpSheet()
+      : ui.receiptIds
+        ? renderReceiptSheet()
+        : ''
   const inert = overlay ? 'inert' : ''
   const opened = { sheet: ui.enter.has('sheet'), card: ui.enter.has('card') }
 
@@ -204,17 +217,17 @@ function render() {
     <header class="mast" ${inert}>
       <div class="brand">
         <span class="brand-name">בתוקף</span>
-        <span class="brand-sub">פירות וירקות בבית</span>
+        <span class="brand-sub">פירות, ירקות ובשר</span>
       </div>
       <time class="mast-date" datetime="${today}">${esc(new Intl.DateTimeFormat('he-IL', { weekday: 'long', day: 'numeric', month: 'long' }).format(new Date()))}</time>
     </header>
     ${ui.syncError ? `<p class="banner banner-warn" ${inert}>${esc(ui.syncError)}</p>` : ''}
-    <main class="view" id="view-${ui.tab}" ${inert}>${views[ui.tab](due)}</main>
+    <main class="view" id="view-${ui.tab}" ${inert}>${views[ui.tab](due, askPrice)}</main>
     <nav class="tabbar" aria-label="ניווט" ${inert}>
       ${TABS.map(
         (t) => `<button class="tab" data-act="tab" data-tab="${t}" ${t === ui.tab ? 'aria-current="page"' : ''}>
           ${icon(t)}<span>${TAB_LABELS[t]}</span>
-          ${t === 'check' && due.length ? `<b class="badge" aria-label="${due.length === 1 ? 'פריט אחד מחכה לבדיקה' : `${due.length} פריטים מחכים לבדיקה`}">${due.length}</b>` : ''}
+          ${t === 'check' && waiting ? `<b class="badge" aria-label="${waiting === 1 ? 'שאלה אחת מחכה' : `${waiting} שאלות מחכות`}">${waiting}</b>` : ''}
           ${t === 'shop' && openShopping().length ? `<b class="badge badge-quiet">${openShopping().length}</b>` : ''}
         </button>`,
       ).join('')}
@@ -224,7 +237,7 @@ function render() {
   `
   ui.enter.clear()
   document.body.classList.toggle('locked', Boolean(overlay))
-  document.title = due.length ? `(${due.length}) בתוקף` : 'בתוקף'
+  document.title = waiting ? `(${waiting}) בתוקף` : 'בתוקף'
   if (TOP_LEVEL && navigator.setAppBadge) (due.length ? navigator.setAppBadge(due.length) : navigator.clearAppBadge()).catch(() => {})
 
   const sheet = document.querySelector('.sheet')
@@ -235,7 +248,7 @@ function render() {
   const find = (sel) => (sel ? ([...root.querySelectorAll(sel)].find(usable) ?? null) : null)
   let target = null
   if (opened.sheet) target = (ui.sheet?.type === 'add' && matchMedia('(pointer: fine)').matches && find('#add-q')) || find('#sheet-title')
-  else if (opened.card && overlay) target = find('#f-name')
+  else if (opened.card && overlay) target = find('#f-name') ?? find('#r-title')
   target ??= find(wanted)
   // The control that had focus is gone (the question was answered, the row removed): carry on
   // from the nearest heading, inside the sheet when one is open.
@@ -247,9 +260,11 @@ const openShopping = () => state.shopping.filter((s) => !s.done)
 
 // -- check ----------------------------------------------------------------------------------
 
-function viewCheck(due) {
+function viewCheck(due, askPrice) {
   if (ui.followUp) return followUpCard()
   if (!state.items.length) return emptyStart()
+  // What the latest shopping cost comes first: it is quick, and memory of it fades fastest.
+  if (askPrice && !ui.receiptIds) return receiptCard(askPrice.items, askPrice.on)
   if (!due.length) return allDone()
   return questionCard(due.find((i) => i.id === ui.askFirst) ?? due[0], due.length)
 }
@@ -361,11 +376,136 @@ function renderFollowUpSheet() {
     </section>`
 }
 
+// -- "how much was it?" -----------------------------------------------------------------------
+
+function receiptItems() {
+  return ui.receiptIds ? state.items.filter((i) => ui.receiptIds.includes(i.id)) : (L.priceQuestion(state, today)?.items ?? [])
+}
+
+// The answers being typed survive renders; a new shopping day keeps what was already typed.
+function receiptDraft() {
+  if (!ui.receipt) {
+    const last = state.settings.lastVendorId
+    ui.receipt = { vendorId: state.vendors.some((v) => v.id === last) ? last : null, newVendor: '', amounts: {}, units: {}, error: null }
+  }
+  return ui.receipt
+}
+
+function receiptCard(items, on) {
+  const r = receiptDraft()
+  const typed = r.newVendor.trim()
+  const chosen = typed ? null : r.vendorId
+  const known = new Set(state.vendors.map((v) => normalizeName(v.name)))
+  const suggestions = VENDOR_SUGGESTIONS.filter((n) => !known.has(normalizeName(n))).slice(0, state.vendors.length ? 4 : 8)
+  const when = on === today ? 'הקנייה של היום' : on === L.addDays(today, -1) ? 'הקנייה של אתמול' : `הקנייה מ־${shortDate(on)}`
+  const rows = items.map((item) => {
+    const unit = r.units[item.id] ?? item.price?.unit ?? item.unit ?? 'kg'
+    const last = chosen ? L.pricesFor(state, item).find((x) => x.vendorId === chosen) : null
+    const best = L.cheapest(state, item)
+    const hint = last
+      ? `בפעם הקודמת שם: ${L.priceText(last.amount, last.unit)}`
+      : best
+        ? `הכי זול שידוע: ${L.priceText(best.amount, best.unit)} ${L.atVendor(best.vendor)}`
+        : ''
+    return `<li class="receipt-row">
+      ${tile(item)}
+      <span class="row-main">
+        <span class="row-name">${esc(item.name)}${item.qty ? ` <span class="qty">${esc(item.qty)}</span>` : ''}</span>
+        ${hint ? `<span class="row-sub">${esc(hint)}</span>` : ''}
+      </span>
+      ${priceInput('rp-' + item.id, r.amounts[item.id] ?? '', unit, 'receipt-unit', item, `כמה עלה ${item.name}`)}
+    </li>`
+  })
+  return `
+    <article class="qcard receipt ${ui.enter.has('card') ? 'enter' : ''}" aria-labelledby="r-title">
+      <div>
+        <p class="eyebrow">${when}</p>
+        <h1 class="qname" id="r-title" tabindex="-1">כמה זה עלה?</h1>
+        <p class="qmeta">${countText(items.length, 'פריט אחד', 'פריטים')}. אפשר למלא רק חלק.</p>
+      </div>
+      <div class="field"><span>איפה קניתם?</span>
+        <div class="chips" role="group" aria-label="חנות">
+          ${state.vendors.map((v) => `<button class="chip" data-act="receipt-vendor" data-vendor="${esc(v.id)}" aria-pressed="${chosen === v.id}">${esc(v.name)}</button>`).join('')}
+          ${suggestions.map((n) => `<button class="chip chip-suggest" data-act="receipt-vendor" data-new="${esc(n)}" aria-pressed="${typed === n}">${esc(n)}</button>`).join('')}
+        </div>
+        <input class="search" id="r-new-vendor" placeholder="חנות אחרת" maxlength="30" autocomplete="off" value="${esc(r.newVendor)}" aria-label="שם של חנות אחרת">
+      </div>
+      <ul class="receipt-list">${rows.join('')}</ul>
+      ${r.error ? `<p class="form-error">${esc(r.error)}</p>` : ''}
+      <div class="answers">
+        <button class="ans ans-fresh" data-act="receipt-save"><span class="ans-label">שמירה</span><span class="ans-hint">החנות והמחירים שמילאתם</span></button>
+        <button class="ans" data-act="receipt-skip"><span class="ans-label">בלי מחירים</span><span class="ans-hint">לא אשאל שוב על הקנייה הזו</span></button>
+      </div>
+    </article>`
+}
+
+function renderReceiptSheet() {
+  return `
+    <div class="sheet-backdrop" data-act="receipt-later"></div>
+    <section class="sheet sheet-card ${ui.enter.has('card') ? 'enter' : ''}" role="dialog" aria-modal="true" aria-labelledby="r-title">
+      ${receiptCard(receiptItems(), today)}
+    </section>`
+}
+
+// A price box with its unit beside it (per kilo, or per unit for a box, a bunch or a pack).
+function priceInput(id, value, unit, act, item, label) {
+  return `<span class="price-in">
+    <input id="${id}" ${act === 'receipt-unit' ? `data-price-for="${esc(item.id)}"` : ''} inputmode="decimal" enterkeyhint="next" autocomplete="off" placeholder="₪" value="${esc(value)}" aria-label="${esc(label)}">
+    <span class="unit-seg" role="group" aria-label="המחיר הוא">
+      <button type="button" data-act="${act}" data-id="${esc(item.id)}" data-unit="kg" aria-pressed="${unit === 'kg'}" aria-label="לקילו">ק״ג</button>
+      <button type="button" data-act="${act}" data-id="${esc(item.id)}" data-unit="unit" aria-pressed="${unit === 'unit'}" aria-label="ליחידה">יח׳</button>
+    </span>
+  </span>`
+}
+
+function trend(r) {
+  if (r.prev == null || r.prev === r.amount) return '<span class="trend"></span>'
+  const up = r.amount > r.prev
+  const diff = L.money(Math.abs(r.amount - r.prev))
+  return `<span class="trend ${up ? 'trend-up' : 'trend-down'}" title="${up ? 'עלה' : 'ירד'} ב־${diff}"><span aria-hidden="true">${up ? '▲' : '▼'}</span> <span class="sr-only">${up ? 'עלה' : 'ירד'} ב־</span>${diff}</span>`
+}
+
+// Every store's latest price for a product, the cheapest marked when there is a choice.
+function priceRows(entry, title = '') {
+  const list = L.pricesFor(state, entry)
+  if (!list.length) return ''
+  const best = new Map()
+  for (const r of list) if (!best.has(r.unit)) best.set(r.unit, r.vendorId)
+  const many = (unit) => list.filter((r) => r.unit === unit).length > 1
+  return `${title ? `<h3 class="section-label">${esc(title)}</h3>` : ''}
+    <ul class="price-rows">${list
+      .map(
+        (r) => `<li>
+          <span class="price-vendor">${esc(r.vendor)}${many(r.unit) && best.get(r.unit) === r.vendorId ? ' <b class="price-best">הכי זול</b>' : ''}</span>
+          <span class="price-amount">${L.priceText(r.amount, r.unit)}</span>
+          ${trend(r)}
+          <span class="price-date">${shortDate(r.on)}</span>
+        </li>`,
+      )
+      .join('')}</ul>`
+}
+
+// The item sheet's store and price, applied inside the same commit as the other edits.
+function savePriceEdit(d, id, draft) {
+  const item = d.items.find((i) => i.id === id)
+  if (!item) return
+  const vendorId = draft.vendorId || null
+  const amount = L.parseAmount(draft.amount)
+  const vendorChanged = vendorId !== (item.vendorId ?? null)
+  const priceChanged = (amount ?? null) !== (item.price?.amount ?? null) || (amount !== null && draft.unit !== item.price?.unit)
+  if (vendorChanged) {
+    item.vendorId = vendorId
+    item.priceAsked = true
+  }
+  if (amount === null && priceChanged) item.price = null
+  else if (amount !== null && (priceChanged || vendorChanged)) L.recordPurchase(d, id, { vendorId, amount, unit: draft.unit })
+}
+
 function emptyStart() {
   return `
     <section class="empty">
       <h1 class="empty-title" tabindex="-1">מה יש בבית?</h1>
-      <p class="lede">מוסיפים את הפירות והירקות שקניתם. כשמגיע הזמן אשאל אם הם עדיין בתוקף, ומה שנגמר או התקלקל יעבור לרשימת הקניות.</p>
+      <p class="lede">מוסיפים את הפירות, הירקות והבשר שקניתם. אשאל כמה הם עלו ואיפה, וכשמגיע הזמן אם הם עדיין בתוקף. מה שנגמר או התקלקל יעבור לרשימת הקניות.</p>
       <h2 class="section-label">הוספה מהירה</h2>
       <div class="pick-grid">${STAPLES.map((k) => pickTile(byKey(k), 'pantry')).join('')}</div>
       <div class="btn-row">
@@ -446,7 +586,7 @@ function pantryRow(item) {
       ${tile(item)}
       <span class="row-main">
         <span class="row-name">${esc(item.name)}${item.qty ? ` <span class="qty">${esc(item.qty)}</span>` : ''}</span>
-        <span class="row-sub">${esc(STORAGE[item.storage] ?? '')} · ${L.atHomeText(f.age)}${due ? ' · <b class="due-dot">מחכה לתשובה</b>' : ''}</span>
+        <span class="row-sub">${esc(STORAGE[item.storage] ?? '')} · ${L.atHomeText(f.age)}${item.vendorId && L.vendorName(state, item.vendorId) ? ` · ${esc(L.vendorName(state, item.vendorId))}` : ''}${due ? ' · <b class="due-dot">מחכה לתשובה</b>' : ''}</span>
       </span>
       <span class="pill">${L.statusText(item, today)}</span>
     </button>
@@ -474,6 +614,7 @@ function viewShop() {
       <button class="btn btn-primary" data-act="open-add" data-mode="shop">${icon('plus')}הוספה</button>
     </div>
     ${state.shopping.some((s) => s.sample) ? `<p class="banner">חלק מהרשימה בא מהמלאי לדוגמה. <button class="link-btn" data-act="clear-sample">ניקוי הדוגמה</button></p>` : ''}
+    ${bestStoreBanner(open)}
     ${
       list.length
         ? `<ul class="list">${list.map(shopRow).join('')}</ul>
@@ -500,11 +641,26 @@ function shopRow(s) {
       ${tile(s)}
       <span class="row-main">
         <span class="row-name">${esc(s.name)}</span>
-        ${s.note ? `<span class="row-sub">${esc(s.note)}</span>` : ''}
+        ${shopSub(s)}
       </span>
     </button>
     <button class="icon-btn" data-act="shop-remove" data-id="${esc(s.id)}" aria-label="הסרת ${esc(s.name)} מהרשימה">${icon('close')}</button>
   </li>`
+}
+
+function shopSub(s) {
+  const c = L.cheapest(state, s)
+  const parts = [s.note, c ? `${c.stores > 1 ? 'הכי זול' : 'מחיר אחרון'}: ${L.priceText(c.amount, c.unit)} ${L.atVendor(c.vendor)}` : ''].filter(Boolean)
+  return parts.length ? `<span class="row-sub">${esc(parts.join(' · '))}</span>` : ''
+}
+
+function bestStoreBanner(open) {
+  const best = L.bestStore(state, open)
+  if (!best) return ''
+  const at = esc(L.atVendor(best.vendor))
+  if (best.compared === 1) return `<p class="banner">לפי המחירים האחרונים, ${at} הכי זול.</p>`
+  const wins = best.wins === 1 ? 'בפריט אחד' : `ב־${best.wins} פריטים`
+  return `<p class="banner">לפי המחירים האחרונים, הכי משתלם לקנות ${at}: שם הכי זול ${wins} מתוך ${best.compared} שאפשר להשוות.</p>`
 }
 
 function chipAdd(p) {
@@ -519,6 +675,83 @@ function copyFallback(where) {
 
 function shoppingText() {
   return ['רשימת קניות:', ...openShopping().map((s) => `• ${s.name}`)].join('\n')
+}
+
+// -- prices ---------------------------------------------------------------------------------
+
+// The product a price-table key stands for: the catalog entry, or what was typed for it.
+function productFor(pid) {
+  if (!pid.startsWith('name:')) return byKey(pid)
+  const same = (x) => L.productId(x) === pid
+  return state.items.find(same) ?? state.shopping.find(same) ?? state.history.findLast(same) ?? { name: pid.slice(5), kind: 'veg' }
+}
+
+function viewPrices() {
+  const products = Object.keys(state.prices)
+    .map((pid) => productFor(pid))
+    .filter((p) => p && L.pricesFor(state, p).length)
+  const kinds = Object.keys(KINDS).filter((k) => products.some((p) => p.kind === k))
+  const shown = products.filter((p) => ui.pricesKind === 'all' || p.kind === ui.pricesKind)
+  const counts = new Map()
+  for (const byVendor of Object.values(state.prices)) for (const vid of Object.keys(byVendor)) counts.set(vid, (counts.get(vid) ?? 0) + 1)
+  const known = new Set(state.vendors.map((v) => normalizeName(v.name)))
+  const suggestions = VENDOR_SUGGESTIONS.filter((n) => !known.has(normalizeName(n)))
+  return `
+    <div class="view-head">
+      <div>
+        <h1 class="view-title" tabindex="-1">מחירים</h1>
+        <p class="view-sub">${products.length ? `${countText(products.length, 'מוצר אחד', 'מוצרים')} · ${countText(state.vendors.length, 'חנות אחת', 'חנויות')}` : 'עוד אין מחירים'}</p>
+      </div>
+    </div>
+
+    <section class="panel">
+      <h2>החנויות שלי</h2>
+      ${
+        state.vendors.length
+          ? `<ul class="vendor-list">${state.vendors
+              .map(
+                (v) => `<li>
+                  <span class="vendor-name">${esc(v.name)}</span>
+                  <span class="vendor-count">${counts.get(v.id) ? countText(counts.get(v.id), 'מחיר אחד', 'מחירים') : 'אין מחירים'}</span>
+                  <button class="icon-btn" data-act="vendor-remove" data-vendor="${esc(v.id)}" aria-label="מחיקת ${esc(v.name)}">${icon('close')}</button>
+                </li>`,
+              )
+              .join('')}</ul>`
+          : '<p class="hint">עוד לא נרשמו חנויות. אחרי קנייה אשאל איפה קניתם, או שאפשר להוסיף כאן.</p>'
+      }
+      <form class="vendor-add" data-form="vendor-add">
+        <input id="v-new" placeholder="שם חנות" maxlength="30" autocomplete="off" aria-label="שם חנות חדשה">
+        <button class="btn" type="submit">${icon('plus')}הוספה</button>
+      </form>
+      ${suggestions.length ? `<div class="chips">${suggestions.map((n) => `<button class="chip chip-suggest" data-act="vendor-suggest" data-name="${esc(n)}">${esc(n)}${icon('plus')}</button>`).join('')}</div>` : ''}
+    </section>
+
+    ${
+      products.length
+        ? `${
+            kinds.length > 1
+              ? `<div class="seg" role="group" aria-label="סינון">${[['all', 'הכל'], ...kinds.map((k) => [k, KINDS[k]])]
+                  .map(([k, label]) => `<button class="seg-btn" data-act="prices-kind" data-kind="${k}" aria-pressed="${ui.pricesKind === k}">${label}</button>`)
+                  .join('')}</div>`
+              : ''
+          }
+          ${Object.keys(KINDS)
+            .map((k) => {
+              const group = shown.filter((p) => p.kind === k).sort((a, b) => a.name.localeCompare(b.name, 'he'))
+              if (!group.length) return ''
+              return `<h2 class="section-label">${KINDS[k]}</h2>
+                <div class="price-cards">${group
+                  .map(
+                    (p) => `<article class="price-card">
+                      <h3 class="price-card-title">${tile(p, 'tile-sm')}<span>${esc(p.name)}</span>${p.cat ? `<span class="price-cat">${esc(MEAT_CATS[p.cat])}</span>` : ''}</h3>
+                      ${priceRows(p)}
+                    </article>`,
+                  )
+                  .join('')}</div>`
+            })
+            .join('')}`
+        : '<p class="lede">אחרי כל קנייה אשאל איפה קניתם וכמה כל דבר עלה. המחירים יופיעו כאן לפי חנות, עם החנות הזולה ביותר ומה התייקר או הוזל מאז הפעם הקודמת.</p>'
+    }`
 }
 
 // -- settings -------------------------------------------------------------------------------
@@ -662,7 +895,7 @@ function renderSheet() {
 }
 
 function addSheet() {
-  const { mode, query, kind } = ui.sheet
+  const { mode, query, kind, cat } = ui.sheet
   return `
     <div class="sheet-head">
       <h2 id="sheet-title" tabindex="-1">${mode === 'shop' ? 'הוספה לרשימת הקניות' : 'הוספה למלאי'}</h2>
@@ -674,18 +907,27 @@ function addSheet() {
         ['all', 'הכל'],
         ['fruit', 'פירות'],
         ['veg', 'ירקות'],
+        ['meat', 'בשר ודגים'],
       ]
         .map(([k, label]) => `<button class="seg-btn" data-act="add-kind" data-kind="${k}" aria-pressed="${kind === k}">${label}</button>`)
         .join('')}
     </div>
+    ${
+      kind === 'meat'
+        ? `<div class="chips" role="group" aria-label="סוג">${[['all', 'הכל'], ...Object.entries(MEAT_CATS)]
+            .map(([k, label]) => `<button class="chip" data-act="add-cat" data-cat="${k}" aria-pressed="${cat === k}">${label}</button>`)
+            .join('')}</div>`
+        : ''
+    }
+    ${mode === 'pantry' ? `<label class="toggle"><input type="checkbox" id="add-freezer" ${ui.sheet.freezer ? 'checked' : ''}><span>ישר למקפיא</span></label>` : ''}
     <div class="pick-grid" id="add-results">${pickResults()}</div>
     <p class="hint">${mode === 'shop' ? 'כל לחיצה מוסיפה לרשימה.' : 'כל לחיצה מוסיפה פריט שנקנה היום. כמות, תאריך ומקום משנים בלחיצה על הפריט במלאי.'}</p>
     <button class="btn btn-primary wide" data-act="close-sheet">סיום</button>`
 }
 
 function pickResults() {
-  const { mode, query, kind } = ui.sheet
-  const results = searchCatalog(query, kind)
+  const { mode, query, kind, cat } = ui.sheet
+  const results = searchCatalog(query, kind, kind === 'meat' ? cat : 'all')
   const custom = query.trim() && !findByName(query)
   const customBtn = custom
     ? `<button class="pick pick-new" data-act="pick-custom" data-mode="${mode}">${icon('plus')}<span>הוספת "${esc(query.trim())}"</span></button>`
@@ -729,6 +971,17 @@ function editSheet() {
           <button type="button" class="icon-btn" data-act="edit-days" data-delta="-1" aria-label="יום אחד פחות"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 12h14"/></svg></button>
         </div>
       </div>
+      <div class="field"><span>חנות ומחיר</span>
+        <div class="price-edit">
+          <select id="e-vendor" aria-label="חנות">
+            <option value="">חנות לא ידועה</option>
+            ${state.vendors.map((v) => `<option value="${esc(v.id)}" ${d.vendorId === v.id ? 'selected' : ''}>${esc(v.name)}</option>`).join('')}
+          </select>
+          ${priceInput('e-price', d.amount, d.unit, 'edit-unit', item, 'מחיר')}
+        </div>
+        ${state.vendors.length ? '' : '<span class="hint">חנויות מוסיפים בלשונית "מחירים", או כשאני שואל כמה עלתה קנייה.</span>'}
+      </div>
+      ${priceRows(item, 'מחירים אחרונים')}
       ${learned && base && learned !== base ? `<p class="hint">ההערכה ההתחלתית הייתה ${L.daysText(base)}. לפי התשובות שלכם עדכנתי ${L.toDays(learned)}.</p>` : ''}
       <p class="hint">השאלה הבאה: ${esc(whenText(item.nextCheckOn))}.</p>
       <button class="btn btn-primary wide" type="submit">שמירה</button>
@@ -748,6 +1001,8 @@ function readEditForm() {
   d.name = v('e-name')?.trim() || d.name
   d.qty = v('e-qty')?.trim() ?? d.qty
   d.boughtOn = v('e-bought') || d.boughtOn
+  d.vendorId = v('e-vendor') ?? d.vendorId
+  d.amount = v('e-price') ?? d.amount
 }
 
 function renderToast() {
@@ -769,7 +1024,8 @@ function addEntry(entry, mode) {
   if (!entry) return
   if (ui.sheet?.type === 'add') ui.sheet.query = ''
   if (mode !== 'shop') {
-    commit((d) => L.addItem(d, entry, today), { toast: `נוסף למלאי: ${entry.name}` })
+    const freezer = ui.sheet?.type === 'add' && ui.sheet.freezer
+    commit((d) => L.addItem(d, entry, today, freezer ? { storage: 'freezer' } : {}), { toast: `נוסף ${freezer ? 'למקפיא' : 'למלאי'}: ${entry.name}` })
   } else if (openShopping().some((s) => L.sameProduct(s, entry))) {
     // Asking for it for real makes a demo entry a real one.
     if (openShopping().some((s) => s.sample && L.sameProduct(s, entry))) commit((d) => L.addToShopping(d, entry, today), { undoable: false })
@@ -839,13 +1095,19 @@ const actions = {
   'open-add'(el) {
     ui.toast = null
     ui.opener = focusSelector(el)
-    ui.sheet = { type: 'add', mode: el.dataset.mode, query: '', kind: 'all' }
+    ui.sheet = { type: 'add', mode: el.dataset.mode, query: '', kind: 'all', cat: 'all', freezer: false }
     ui.enter.add('sheet')
     render()
   },
 
   'add-kind'(el) {
     ui.sheet.kind = el.dataset.kind
+    ui.sheet.cat = 'all'
+    render()
+  },
+
+  'add-cat'(el) {
+    ui.sheet.cat = el.dataset.cat
     render()
   },
 
@@ -855,8 +1117,9 @@ const actions = {
     const name = ui.sheet.query.trim()
     if (!name) return
     const kind = ui.sheet.kind === 'all' ? 'veg' : ui.sheet.kind
+    const cat = kind === 'meat' && ui.sheet.cat !== 'all' ? ui.sheet.cat : null
     ui.sheet.query = ''
-    addEntry({ name, kind }, el.dataset.mode)
+    addEntry({ name, kind, cat }, el.dataset.mode)
   },
 
   'close-sheet'() {
@@ -870,7 +1133,8 @@ const actions = {
     const { name, qty, storage, boughtOn, shelfLife } = item
     ui.toast = null
     ui.opener = focusSelector(el)
-    ui.sheet = { type: 'edit', id: item.id, draft: { name, qty, storage, boughtOn, shelfLife } }
+    const price = { vendorId: item.vendorId ?? '', amount: item.price ? String(item.price.amount) : '', unit: item.price?.unit ?? item.unit ?? 'kg' }
+    ui.sheet = { type: 'edit', id: item.id, draft: { name, qty, storage, boughtOn, shelfLife, ...price } }
     ui.enter.add('sheet')
     render()
   },
@@ -937,6 +1201,91 @@ const actions = {
     commit((d) => L.removeItem(d, id, null, today), { toast: `נמחק מהמלאי: ${item?.name}` })
   },
 
+  'receipt-vendor'(el) {
+    const r = receiptDraft()
+    r.error = null
+    if (el.dataset.vendor) {
+      r.vendorId = el.dataset.vendor
+      r.newVendor = ''
+    } else {
+      r.vendorId = null
+      r.newVendor = el.dataset.new
+    }
+    render()
+  },
+
+  'receipt-unit'(el) {
+    receiptDraft().units[el.dataset.id] = el.dataset.unit
+    render()
+  },
+
+  'receipt-save'() {
+    const items = receiptItems()
+    const r = receiptDraft()
+    const answers = items.map((item) => ({ item, text: String(r.amounts[item.id] ?? '').trim() }))
+    const bad = answers.find((a) => a.text && !L.parseAmount(a.text))
+    const name = r.newVendor.trim()
+    r.error = bad
+      ? `המחיר של ${bad.item.name} לא נראה כמו מספר. למשל 12.90`
+      : answers.some((a) => a.text) && !name && !r.vendorId
+        ? 'בחרו איפה קניתם, כדי שאוכל להשוות בין חנויות.'
+        : null
+    if (r.error) {
+      announce(r.error, urgent)
+      ui.focus = bad ? '#rp-' + bad.item.id : '#r-new-vendor'
+      render()
+      return
+    }
+    const priced = answers.filter((a) => a.text).length
+    ui.receipt = null
+    ui.receiptIds = null
+    ui.enter.add('card')
+    commit(
+      (d) => {
+        const vendor = name ? L.addVendor(d, name) : (d.vendors.find((v) => v.id === r.vendorId) ?? null)
+        for (const a of answers) {
+          const unit = r.units[a.item.id] ?? a.item.price?.unit ?? a.item.unit
+          L.recordPurchase(d, a.item.id, { vendorId: vendor?.id ?? null, amount: a.text || null, unit })
+        }
+        if (vendor) d.settings.lastVendorId = vendor.id
+      },
+      { toast: priced ? (priced === 1 ? 'נשמר מחיר אחד' : `נשמרו ${priced} מחירים`) : 'נשמר' },
+    )
+  },
+
+  'receipt-skip'() {
+    const ids = receiptItems().map((i) => i.id)
+    ui.receipt = null
+    ui.receiptIds = null
+    ui.enter.add('card')
+    commit((d) => L.skipPrices(d, ids), { toast: 'בסדר, בלי מחירים הפעם' })
+  },
+
+  'receipt-later'() {
+    ui.receiptIds = null
+    render()
+  },
+
+  'edit-unit'(el) {
+    readEditForm()
+    ui.sheet.draft.unit = el.dataset.unit
+    render()
+  },
+
+  'vendor-remove'(el) {
+    const name = L.vendorName(state, el.dataset.vendor)
+    commit((d) => L.removeVendor(d, el.dataset.vendor), { toast: `נמחקה החנות ${name} והמחירים שלה` })
+  },
+
+  'vendor-suggest'(el) {
+    commit((d) => L.addVendor(d, el.dataset.name), { toast: `נוספה חנות: ${el.dataset.name}` })
+  },
+
+  'prices-kind'(el) {
+    ui.pricesKind = el.dataset.kind
+    render()
+  },
+
   'shop-toggle': (el) => commit((d) => L.toggleShopping(d, el.dataset.id), { undoable: false }),
 
   'shop-remove'(el) {
@@ -946,7 +1295,12 @@ const actions = {
 
   checkout() {
     const n = state.shopping.filter((s) => s.done).length
-    commit((d) => L.checkout(d, today), { toast: `${countText(n, 'פריט אחד עבר', 'פריטים עברו')} למלאי` })
+    ui.enter.add('card')
+    const bought = commit((d) => L.checkout(d, today), { toast: `${countText(n, 'פריט אחד עבר', 'פריטים עברו')} למלאי` })
+    ui.receiptIds = bought.map((i) => i.id)
+    ui.receipt = null
+    ui.enter.add('card')
+    render()
   },
 
   async 'copy-list'() {
@@ -1063,6 +1417,11 @@ root.addEventListener('input', (e) => {
   // What is typed lives in ui state, so a render from another window or device keeps it.
   if (e.target.closest?.('[data-form="edit"]')) readEditForm()
   if (e.target.id === 'restore-text') ui.restoreText = e.target.value
+  if (e.target.dataset?.priceFor && ui.receipt) ui.receipt.amounts[e.target.dataset.priceFor] = e.target.value
+  if (e.target.id === 'r-new-vendor' && ui.receipt) {
+    ui.receipt.newVendor = e.target.value
+    if (e.target.value.trim()) for (const chip of root.querySelectorAll('[data-act="receipt-vendor"]')) chip.setAttribute('aria-pressed', 'false')
+  }
   if (e.target.id === 'add-q' && ui.sheet?.type === 'add') {
     ui.sheet.query = e.target.value
     document.getElementById('add-results').innerHTML = pickResults()
@@ -1080,6 +1439,7 @@ root.addEventListener('change', async (e) => {
     document.getElementById('gcal')?.setAttribute('href', googleCalendarUrl())
     announce(`התזכורת תהיה ב־${t.value}`)
   }
+  if (t.id === 'add-freezer' && ui.sheet?.type === 'add') ui.sheet.freezer = t.checked
   if (t.id === 'notify') {
     if (t.checked && Notification.permission !== 'granted') {
       const p = await Notification.requestPermission().catch(() => 'denied')
@@ -1091,6 +1451,14 @@ root.addEventListener('change', async (e) => {
 })
 
 root.addEventListener('keydown', (e) => {
+  // Enter in a price moves on to the next one, then to saving.
+  if (e.key === 'Enter' && e.target.dataset?.priceFor) {
+    e.preventDefault()
+    const inputs = [...root.querySelectorAll('[data-price-for]')]
+    const next = inputs[inputs.indexOf(e.target) + 1]
+    ;(next ?? root.querySelector('[data-act="receipt-save"]'))?.focus()
+    return
+  }
   if (e.key === 'Enter' && e.target.id === 'add-q') {
     e.preventDefault()
     // Enter (or the keyboard's Done key) on an empty search only closes the keyboard.
@@ -1105,8 +1473,23 @@ root.addEventListener('submit', (e) => {
   if (form === 'edit') {
     readEditForm()
     const { id, draft } = ui.sheet
+    if (draft.amount.trim() && !L.parseAmount(draft.amount)) {
+      showToast('המחיר לא נראה כמו מספר. למשל 12.90')
+      render()
+      document.getElementById('e-price')?.focus()
+      return
+    }
     closeSheet()
-    commit((d) => L.editItem(d, id, draft, today), { toast: 'נשמר' })
+    commit((d) => {
+      L.editItem(d, id, draft, today)
+      savePriceEdit(d, id, draft)
+    }, { toast: 'נשמר' })
+  }
+  if (form === 'vendor-add') {
+    const name = document.getElementById('v-new')?.value.trim()
+    if (!name) return
+    commit((d) => L.addVendor(d, name), { toast: `נוספה חנות: ${name}` })
+    document.getElementById('v-new')?.focus()
   }
   if (form === 'restore') {
     let parsed
@@ -1142,9 +1525,10 @@ window.addEventListener('hashchange', () => {
 })
 
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && (ui.sheet || (ui.followUp && ui.tab !== 'check'))) {
+  if (e.key === 'Escape' && (ui.sheet || (ui.followUp && ui.tab !== 'check') || ui.receiptIds)) {
     if (ui.sheet) closeSheet()
-    else ui.followUp = null
+    else if (ui.followUp && ui.tab !== 'check') ui.followUp = null
+    else ui.receiptIds = null // asked again from the check tab
     render()
   }
 })

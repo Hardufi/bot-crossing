@@ -1,7 +1,7 @@
 // Everything the app decides, with no DOM in it, so it can be tested on its own.
 // Days are local calendar days written 'YYYY-MM-DD'; they compare correctly as strings.
 
-import { byKey, normalizeName, FREEZER_DAYS, STORAGE } from './catalog.js'
+import { byKey, normalizeName, FREEZER_DAYS, STORAGE, KINDS, MEAT_CATS, UNITS } from './catalog.js'
 
 export const MAX_HISTORY = 400
 export const MAX_CHECK_GAP = 14
@@ -40,7 +40,11 @@ export function emptyState() {
     history: [],
     // Shelf life you have taught the app, in days, by catalog key or item name.
     learned: {},
-    settings: { remindAt: '19:00' },
+    // Where you shop: [{id, name}].
+    vendors: [],
+    // The latest price at each store: {productId: {vendorId: {amount, unit, on, prev}}}.
+    prices: {},
+    settings: { remindAt: '19:00', lastVendorId: null },
     updatedAt: 0,
   }
 }
@@ -56,6 +60,7 @@ export function looksLikeBackup(raw) {
 }
 
 const MAX_DAYS = 3650
+const MAX_PRICE = 100000
 const text = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : typeof v === 'number' && Number.isFinite(v) ? String(v) : '')
 const count = (v) => {
   const n = Math.round(Number(v))
@@ -66,14 +71,27 @@ const count = (v) => {
 function cleanProduct(raw) {
   const name = text(raw.name, 60)
   if (!name) return null
+  const known = typeof raw.key === 'string' ? byKey(raw.key) : null
+  const kind = known?.kind ?? (Object.hasOwn(KINDS, raw.kind) ? raw.kind : 'veg')
   return {
-    key: typeof raw.key === 'string' && byKey(raw.key) ? raw.key : null,
+    key: known ? raw.key : null,
     name,
     emoji: typeof raw.emoji === 'string' && raw.emoji ? raw.emoji.slice(0, 16) : null,
     color: typeof raw.color === 'string' && /^#[0-9a-f]{6}$/i.test(raw.color) ? raw.color : null,
-    kind: raw.kind === 'fruit' ? 'fruit' : 'veg',
+    kind,
+    cat: known?.cat ?? (kind === 'meat' && Object.hasOwn(MEAT_CATS, raw.cat) ? raw.cat : null),
+    unit: Object.hasOwn(UNITS, raw.unit) ? raw.unit : (known?.unit ?? 'kg'),
   }
 }
+
+// A price as typed: "12.9", "12,90" or "₪ 12.90". Null when it is not a usable price.
+export function parseAmount(v) {
+  const n = typeof v === 'number' ? v : Number(String(v ?? '').replace(/[₪\s]/g, '').replace(',', '.'))
+  if (!Number.isFinite(n) || n <= 0 || n > MAX_PRICE) return null
+  return Math.round(n * 100) / 100
+}
+
+const cleanUnit = (u) => (Object.hasOwn(UNITS, u) ? u : null)
 
 // Accepts anything that came out of storage, another device or a pasted backup, and returns a
 // state the app can render safely: every field the right type, every id unique and plain.
@@ -88,11 +106,24 @@ export function normalizeState(raw) {
   }
   const list = (v) => (Array.isArray(v) ? v.filter((x) => x && typeof x === 'object') : [])
 
+  const vendors = []
+  const vendorIds = new Set()
+  for (const v of list(raw.vendors)) {
+    const name = text(v.name, 30)
+    if (!name || vendors.some((x) => normalizeName(x.name) === normalizeName(name))) continue
+    const id = typeof v.id === 'string' && /^[a-z0-9]{1,40}$/i.test(v.id) && !vendorIds.has(v.id) ? v.id : uid() + vendors.length
+    vendorIds.add(id)
+    vendors.push({ id, name })
+  }
+  const vendorOf = (v) => (typeof v === 'string' && vendorIds.has(v) ? v : null)
+
   const items = []
   for (const i of list(raw.items)) {
     const p = cleanProduct(i)
     const shelfLife = count(i.shelfLife)
     if (!p || !shelfLife || !isDay(i.boughtOn) || !isDay(i.nextCheckOn)) continue
+    const amount = parseAmount(i.price?.amount)
+    const unit = cleanUnit(i.price?.unit)
     const item = {
       id: cleanId(i.id),
       ...p,
@@ -103,10 +134,28 @@ export function normalizeState(raw) {
       nextCheckOn: i.nextCheckOn,
       useSoon: i.useSoon === true,
       lastCheckedOn: isDay(i.lastCheckedOn) ? i.lastCheckedOn : null,
+      vendorId: vendorOf(i.vendorId),
+      price: amount && unit ? { amount, unit } : null,
     }
+    // Ask "how much was it?" once. Items from before prices existed are asked too, but only
+    // while the purchase is recent (see needsPrice).
+    item.priceAsked = i.priceAsked === true || i.sample === true || item.price !== null || item.vendorId !== null
     if (i.wasFrozen === true) item.wasFrozen = true
     if (i.sample === true) item.sample = true
     items.push(item)
+  }
+
+  const prices = {}
+  if (raw.prices && typeof raw.prices === 'object') {
+    for (const [pid, byVendor] of Object.entries(raw.prices)) {
+      if (pid.length > 80 || !byVendor || typeof byVendor !== 'object') continue
+      for (const [vid, r] of Object.entries(byVendor)) {
+        const amount = parseAmount(r?.amount)
+        const unit = cleanUnit(r?.unit)
+        if (!vendorOf(vid) || !amount || !unit || !isDay(r.on)) continue
+        ;(prices[pid] ??= {})[vid] = { amount, unit, on: r.on, prev: parseAmount(r.prev) }
+      }
+    }
   }
 
   const shopping = []
@@ -141,7 +190,12 @@ export function normalizeState(raw) {
     shopping,
     history,
     learned,
-    settings: { remindAt: typeof remindAt === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(remindAt) ? remindAt : base.settings.remindAt },
+    vendors,
+    prices,
+    settings: {
+      remindAt: typeof remindAt === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(remindAt) ? remindAt : base.settings.remindAt,
+      lastVendorId: vendorOf(raw.settings?.lastVendorId),
+    },
     updatedAt: Number(raw.updatedAt) || 0,
   }
 }
@@ -164,6 +218,8 @@ export function product(entry) {
     emoji: entry.emoji ?? known?.emoji ?? null,
     color: entry.color ?? known?.color ?? null,
     kind: entry.kind ?? known?.kind ?? 'veg',
+    cat: entry.cat ?? known?.cat ?? null,
+    unit: entry.unit ?? known?.unit ?? 'kg',
     days: entry.days ?? known?.days ?? 7,
     storage: entry.storage ?? known?.storage ?? 'fridge',
   }
@@ -225,6 +281,8 @@ export function addItem(state, entry, today, extra = {}) {
     emoji: p.emoji,
     color: p.color,
     kind: p.kind,
+    cat: p.cat,
+    unit: p.unit,
     storage,
     qty: extra.qty ?? '',
     boughtOn,
@@ -232,6 +290,9 @@ export function addItem(state, entry, today, extra = {}) {
     nextCheckOn: firstCheckOn(boughtOn, shelfLife),
     useSoon: false,
     lastCheckedOn: null,
+    vendorId: null,
+    price: null,
+    priceAsked: Boolean(extra.sample),
   }
   if (extra.sample) item.sample = true
   state.items.push(item)
@@ -270,8 +331,8 @@ export function editItem(state, id, changes, today) {
 }
 
 function remember(state, item, type, age, today) {
-  const { key, name, emoji, color, kind } = item
-  state.history.push({ id: uid(), type, key, name, emoji, color, kind, on: today, age })
+  const { key, name, emoji, color, kind, cat, unit } = item
+  state.history.push({ id: uid(), type, key, name, emoji, color, kind, cat, unit, on: today, age })
   if (state.history.length > MAX_HISTORY) state.history.splice(0, state.history.length - MAX_HISTORY)
 }
 
@@ -340,7 +401,7 @@ export function addToShopping(state, entry, today, note = '') {
     if (!entry.sample) delete existing.sample
     return { entry: existing, added: false }
   }
-  const s = { id: uid(), key: p.key, name: p.name, emoji: p.emoji, color: p.color, kind: p.kind, note, addedOn: today, done: false }
+  const s = { id: uid(), key: p.key, name: p.name, emoji: p.emoji, color: p.color, kind: p.kind, cat: p.cat, unit: p.unit, note, addedOn: today, done: false }
   if (entry.sample) s.sample = true
   state.shopping.push(s)
   return { entry: s, added: true }
@@ -403,6 +464,112 @@ export function recentlyFinished(state, today, days = 14, limit = 8) {
   return out
 }
 
+// ---- stores and prices -----------------------------------------------------------------------
+
+export const PRICE_WINDOW = 3 // days after a purchase during which the app asks what it cost
+
+export function vendorName(state, id) {
+  return state.vendors.find((v) => v.id === id)?.name ?? null
+}
+
+// A store by name, created on first use. Names match the way products do: "רמי-לוי" is "רמי לוי".
+export function addVendor(state, name) {
+  const clean = String(name ?? '').trim().slice(0, 30)
+  if (!clean) return null
+  const existing = state.vendors.find((v) => normalizeName(v.name) === normalizeName(clean))
+  if (existing) return existing
+  const vendor = { id: uid(), name: clean }
+  state.vendors.push(vendor)
+  return vendor
+}
+
+// Forgets a store and the prices it had. Items bought there keep their own price.
+export function removeVendor(state, id) {
+  state.vendors = state.vendors.filter((v) => v.id !== id)
+  if (state.settings.lastVendorId === id) state.settings.lastVendorId = null
+  for (const [pid, byVendor] of Object.entries(state.prices)) {
+    delete byVendor[id]
+    if (!Object.keys(byVendor).length) delete state.prices[pid]
+  }
+  for (const item of state.items) if (item.vendorId === id) item.vendorId = null
+}
+
+// Whether to ask what this item cost: a real purchase from the last few days not yet asked about.
+export function needsPrice(item, today) {
+  return !item.priceAsked && !item.sample && daysBetween(item.boughtOn, today) <= PRICE_WINDOW && item.boughtOn <= today
+}
+
+// The most recent shopping day with something still to ask about, and what was bought then.
+export function priceQuestion(state, today) {
+  const open = state.items.filter((i) => needsPrice(i, today))
+  if (!open.length) return null
+  const on = open.reduce((a, i) => (i.boughtOn > a ? i.boughtOn : a), open[0].boughtOn)
+  return { on, items: open.filter((i) => i.boughtOn === on) }
+}
+
+// Records where an item was bought and, if given, what it cost. The store's latest price for the
+// product moves only for a purchase at least as recent as the one it holds.
+export function recordPurchase(state, itemId, { vendorId = null, amount = null, unit = null } = {}) {
+  const item = state.items.find((i) => i.id === itemId)
+  if (!item) return null
+  item.priceAsked = true
+  if (vendorId && !state.vendors.some((v) => v.id === vendorId)) vendorId = null
+  if (vendorId) item.vendorId = vendorId
+  const value = parseAmount(amount)
+  const u = cleanUnit(unit) ?? item.unit ?? 'kg'
+  if (!value) return item
+  item.price = { amount: value, unit: u }
+  if (!item.vendorId) return item
+  const byVendor = (state.prices[productId(item)] ??= {})
+  const old = byVendor[item.vendorId]
+  if (!old || item.boughtOn >= old.on) {
+    const prev = old && old.unit === u ? (old.on === item.boughtOn ? old.prev : old.amount) : null
+    byVendor[item.vendorId] = { amount: value, unit: u, on: item.boughtOn, prev }
+  }
+  return item
+}
+
+// Marks items as asked without recording anything ("I don't remember").
+export function skipPrices(state, ids) {
+  for (const item of state.items) if (ids.includes(item.id)) item.priceAsked = true
+}
+
+// Every store's latest price for a product, cheapest first within each unit, the product's own
+// unit first.
+export function pricesFor(state, entry) {
+  const p = product(entry)
+  const byVendor = state.prices[productId(p)] ?? {}
+  return Object.entries(byVendor)
+    .map(([vendorId, r]) => ({ vendorId, vendor: vendorName(state, vendorId), ...r }))
+    .filter((r) => r.vendor)
+    .sort((a, b) => (a.unit === b.unit ? a.amount - b.amount : a.unit === p.unit ? -1 : b.unit === p.unit ? 1 : a.unit < b.unit ? -1 : 1))
+}
+
+// The cheapest known price for a product, compared only with prices in the same unit.
+export function cheapest(state, entry) {
+  const list = pricesFor(state, entry)
+  if (!list.length) return null
+  const unit = list[0].unit
+  const same = list.filter((r) => r.unit === unit)
+  return { ...same[0], stores: same.length }
+}
+
+// For a shopping list: the store that is cheapest for the most items, among items with prices
+// from at least two stores.
+export function bestStore(state, entries) {
+  const wins = new Map()
+  let compared = 0
+  for (const e of entries) {
+    const c = cheapest(state, e)
+    if (!c || c.stores < 2) continue
+    compared++
+    wins.set(c.vendorId, (wins.get(c.vendorId) ?? 0) + 1)
+  }
+  if (!compared) return null
+  const [vendorId, count] = [...wins].sort((a, b) => b[1] - a[1])[0]
+  return { vendorId, vendor: vendorName(state, vendorId), wins: count, compared }
+}
+
 // ---- Hebrew wording -------------------------------------------------------------------------
 
 // Counts are joined to their noun with a no-break space so "4 ימים" never splits across lines.
@@ -452,4 +619,22 @@ export function statusText(item, today) {
   if (item.useSoon) return 'לאכול בקרוב'
   if (left <= 2) return 'עוד ' + (left === 1 ? 'יום' : 'יומיים')
   return 'עוד ' + aboutDays(left)
+}
+
+const shekel = new Intl.NumberFormat('he-IL', { style: 'currency', currency: 'ILS', minimumFractionDigits: 2, maximumFractionDigits: 2 })
+
+export function money(amount) {
+  return shekel.format(amount)
+}
+
+// "12.90 ₪ לק״ג"
+export function priceText(amount, unit) {
+  return `${money(amount)}${NB}${UNITS[unit] ?? ''}`.trim()
+}
+
+// "at <store>": ב joined to the name, absorbing a leading ה (השוק → בשוק).
+export function atVendor(name) {
+  if (/^ה[\u05d0-\u05ea]/.test(name)) return 'ב' + name.slice(1)
+  if (/^[\u05d0-\u05ea]/.test(name)) return 'ב' + name
+  return 'ב־' + name
 }

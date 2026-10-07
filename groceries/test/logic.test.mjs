@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import * as L from '../logic.js'
-import { byKey, searchCatalog, findByName, inSeason, CATALOG, STAPLES, SEASON } from '../catalog.js'
+import { byKey, searchCatalog, findByName, inSeason, CATALOG, STAPLES, SEASON, MEAT_CATS, UNITS, VENDOR_SUGGESTIONS } from '../catalog.js'
 
 const T = '2026-10-06'
 
@@ -404,4 +404,152 @@ test('names are capped where they come in, so a reload never changes a product',
   assert.equal(item.name.length, 60)
   const again = L.normalizeState(JSON.parse(JSON.stringify(s)))
   assert.equal(L.productId(again.items[0]), L.productId(item))
+})
+
+test('meat: every category is stocked, searchable, and keeps briefly in the fridge', () => {
+  const meat = CATALOG.filter((p) => p.kind === 'meat')
+  for (const cat of Object.keys(MEAT_CATS)) assert.ok(meat.some((p) => p.cat === cat), cat)
+  for (const p of meat) {
+    assert.ok(Object.hasOwn(MEAT_CATS, p.cat), p.key)
+    assert.ok(Object.hasOwn(UNITS, p.unit), p.key)
+    if (p.cat !== 'processed') assert.ok(p.days <= 3, `${p.key} raw meat keeps days, not weeks`)
+  }
+  assert.equal(searchCatalog('שניצל')[0].key, 'chicken-breast')
+  assert.equal(searchCatalog('טחון')[0].key, 'ground-beef')
+  assert.equal(searchCatalog('עוף')[0].key, 'whole-chicken')
+  assert.ok(searchCatalog('', 'meat', 'fish').every((p) => p.cat === 'fish'))
+  assert.equal(searchCatalog('', 'fruit', 'fish').length, 0)
+
+  const s = L.emptyState()
+  const chicken = L.addItem(s, byKey('chicken-breast'), T)
+  assert.equal(chicken.nextCheckOn, L.addDays(T, 1), 'asked about the very next day')
+  assert.equal(chicken.cat, 'chicken')
+  const frozen = L.addItem(s, byKey('ground-beef'), T, { storage: 'freezer' })
+  assert.equal(frozen.shelfLife, 90)
+  L.editItem(s, frozen.id, { storage: 'fridge' }, L.addDays(T, 30))
+  assert.equal(frozen.shelfLife, 1, 'thawed mince is for today or tomorrow')
+})
+
+test('prices are typed the way people type them', () => {
+  assert.equal(L.parseAmount('12.9'), 12.9)
+  assert.equal(L.parseAmount('12,90'), 12.9)
+  assert.equal(L.parseAmount(' ₪ 7 '), 7)
+  assert.equal(L.parseAmount('3.456'), 3.46)
+  for (const bad of ['', 'abc', '0', '-4', '1e9', null, undefined]) assert.equal(L.parseAmount(bad), null, String(bad))
+  assert.match(L.priceText(12.9, 'kg'), /12\.90/)
+  assert.match(L.priceText(12.9, 'kg'), /לק״ג$/)
+})
+
+test('stores are named once, whatever the spelling', () => {
+  const s = L.emptyState()
+  const a = L.addVendor(s, 'רמי לוי')
+  assert.equal(L.addVendor(s, ' רמי-לוי ').id, a.id)
+  assert.equal(L.addVendor(s, '   '), null)
+  L.addVendor(s, 'שופרסל')
+  assert.deepEqual(s.vendors.map((v) => v.name), ['רמי לוי', 'שופרסל'])
+  assert.ok(VENDOR_SUGGESTIONS.includes('רמי לוי'))
+})
+
+test('a purchase records the store, the price and which way it moved', () => {
+  const s = L.emptyState()
+  const rami = L.addVendor(s, 'רמי לוי')
+  const shufersal = L.addVendor(s, 'שופרסל')
+  const t1 = L.addItem(s, byKey('tomato'), T, { boughtOn: L.addDays(T, -10) })
+  L.recordPurchase(s, t1.id, { vendorId: rami.id, amount: '6.90', unit: 'kg' })
+  const t2 = L.addItem(s, byKey('tomato'), T)
+  L.recordPurchase(s, t2.id, { vendorId: rami.id, amount: '7.90', unit: 'kg' })
+  const t3 = L.addItem(s, byKey('tomato'), T, { boughtOn: L.addDays(T, -1) })
+  L.recordPurchase(s, t3.id, { vendorId: shufersal.id, amount: '5.90' })
+
+  assert.deepEqual(t2.price, { amount: 7.9, unit: 'kg' })
+  assert.equal(t2.vendorId, rami.id)
+  assert.deepEqual(s.prices.tomato[rami.id], { amount: 7.9, unit: 'kg', on: T, prev: 6.9 })
+  assert.equal(s.prices.tomato[shufersal.id].unit, 'kg', 'the product\'s usual unit when none is given')
+
+  // An older receipt typed in late does not replace a newer price.
+  const old = L.addItem(s, byKey('tomato'), T, { boughtOn: L.addDays(T, -20) })
+  L.recordPurchase(s, old.id, { vendorId: rami.id, amount: '3' })
+  assert.equal(s.prices.tomato[rami.id].amount, 7.9)
+  // Correcting today's price does not count as a price change.
+  const fix = L.addItem(s, byKey('tomato'), T)
+  L.recordPurchase(s, fix.id, { vendorId: rami.id, amount: '7.50' })
+  assert.deepEqual(s.prices.tomato[rami.id], { amount: 7.5, unit: 'kg', on: T, prev: 6.9 })
+
+  assert.deepEqual(L.pricesFor(s, byKey('tomato')).map((r) => [r.vendor, r.amount]), [['שופרסל', 5.9], ['רמי לוי', 7.5]])
+  const c = L.cheapest(s, byKey('tomato'))
+  assert.equal(c.vendor, 'שופרסל')
+  assert.equal(c.stores, 2)
+  assert.deepEqual(L.bestStore(s, [byKey('tomato'), byKey('banana')]), { vendorId: shufersal.id, vendor: 'שופרסל', wins: 1, compared: 1 })
+
+  // A store can be forgotten, and its prices with it.
+  L.removeVendor(s, shufersal.id)
+  assert.equal(L.cheapest(s, byKey('tomato')).vendor, 'רמי לוי')
+  assert.equal(t3.vendorId, null)
+  assert.deepEqual(t3.price, { amount: 5.9, unit: 'kg' }, 'what was paid stays on the item')
+})
+
+test('prices in different units are never compared', () => {
+  const s = L.emptyState()
+  const a = L.addVendor(s, 'א')
+  const b = L.addVendor(s, 'ב')
+  const x = L.addItem(s, byKey('strawberry'), T) // sold by the box
+  L.recordPurchase(s, x.id, { vendorId: a.id, amount: 12, unit: 'unit' })
+  const y = L.addItem(s, byKey('strawberry'), T)
+  L.recordPurchase(s, y.id, { vendorId: b.id, amount: 30, unit: 'kg' })
+  const c = L.cheapest(s, byKey('strawberry'))
+  assert.equal(c.unit, 'unit')
+  assert.equal(c.stores, 1)
+  assert.equal(L.bestStore(s, [byKey('strawberry')]), null, 'nothing to compare')
+})
+
+test('the app asks what the latest shopping cost, once, while it is fresh in memory', () => {
+  const s = L.emptyState()
+  const old = L.addItem(s, byKey('apple'), T, { boughtOn: L.addDays(T, -L.PRICE_WINDOW - 1) })
+  const yesterday = L.addItem(s, byKey('banana'), T, { boughtOn: L.addDays(T, -1) })
+  const a = L.addItem(s, byKey('salmon'), T)
+  const b = L.addItem(s, byKey('lettuce'), T)
+  L.addItem(s, byKey('carrot'), T, { sample: true })
+  let q = L.priceQuestion(s, T)
+  assert.equal(q.on, T)
+  assert.deepEqual(q.items.map((i) => i.id), [a.id, b.id])
+
+  const v = L.addVendor(s, 'השוק')
+  L.recordPurchase(s, a.id, { vendorId: v.id, amount: '89.90' })
+  L.recordPurchase(s, b.id, { vendorId: v.id }) // the store, without a price
+  assert.equal(b.vendorId, v.id)
+  assert.equal(b.price, null)
+  q = L.priceQuestion(s, T)
+  assert.deepEqual(q.items.map((i) => i.id), [yesterday.id])
+  L.skipPrices(s, [yesterday.id])
+  assert.equal(L.priceQuestion(s, T), null)
+  assert.equal(old.priceAsked, false, 'too old to ask about, so it is simply never asked')
+})
+
+test('normalizeState keeps stores and prices consistent and safe', () => {
+  const evil = '"><img src=x onerror=alert(1)>'
+  const s = L.normalizeState({
+    vendors: [{ id: 'v1', name: 'רמי לוי' }, { id: 'v1', name: 'שופרסל' }, { id: evil, name: 'השוק' }, { id: 'v9', name: ' רמי-לוי ' }, { name: '' }],
+    items: [
+      { id: 'a', name: 'עגבנייה', key: 'tomato', boughtOn: T, nextCheckOn: T, shelfLife: 6, vendorId: 'v1', price: { amount: '7.9', unit: 'kg' } },
+      { id: 'b', name: 'חסה', key: 'lettuce', boughtOn: T, nextCheckOn: T, shelfLife: 5, vendorId: 'gone', price: { amount: -3, unit: 'kg' } },
+      { id: 'c', name: 'בננה', key: 'banana', boughtOn: T, nextCheckOn: T, shelfLife: 5, priceAsked: true },
+      { id: 'd', name: 'חזה עוף', key: 'chicken-breast', boughtOn: T, nextCheckOn: T, shelfLife: 2, kind: 'fruit', cat: 'fish' },
+    ],
+    prices: { tomato: { v1: { amount: 7.9, unit: 'kg', on: T, prev: 'x' }, gone: { amount: 1, unit: 'kg', on: T } }, banana: { v1: { amount: 5, unit: 'litre', on: T } } },
+  })
+  assert.equal(s.vendors.length, 3)
+  assert.equal(s.vendors[0].id, 'v1')
+  assert.notEqual(s.vendors[1].id, 'v1', 'duplicate store ids are replaced')
+  assert.match(s.vendors[2].id, /^[a-z0-9]+$/i)
+  const [a, b, c, d] = s.items
+  assert.equal(a.vendorId, 'v1')
+  assert.deepEqual(a.price, { amount: 7.9, unit: 'kg' })
+  assert.equal(a.priceAsked, true)
+  assert.equal(b.vendorId, null)
+  assert.equal(b.price, null)
+  assert.equal(b.priceAsked, false, 'an item from before prices existed is asked about while recent')
+  assert.equal(c.priceAsked, true)
+  assert.equal(d.kind, 'meat', 'catalog items keep their catalog kind')
+  assert.equal(d.cat, 'chicken')
+  assert.deepEqual(s.prices, { tomato: { v1: { amount: 7.9, unit: 'kg', on: T, prev: null } } })
 })

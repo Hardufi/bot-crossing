@@ -1,8 +1,8 @@
 // Keeps the app opening offline, and brings it forward when a reminder is tapped.
 // Bump VERSION whenever any file in SHELL changes, so installed copies pick it up.
 
-const VERSION = 'betokef-v2'
-const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'logic.js', 'catalog.js', 'storage.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png']
+const VERSION = 'betokef-v3'
+const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'logic.js', 'catalog.js', 'storage.js', 'frames.js', 'vision.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png']
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()))

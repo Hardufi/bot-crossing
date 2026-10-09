@@ -1292,6 +1292,133 @@ button {
   }
 }
 
+/* ---- updating from a video --------------------------------------------------------------- */
+
+.scan-cta {
+  min-height: 52px;
+  font-size: var(--step-1);
+}
+
+.scan-actions {
+  display: grid;
+  gap: 8px;
+}
+
+.file-btn {
+  position: relative;
+  cursor: pointer;
+}
+
+/* The real file input stays focusable and reachable, under a label that looks like a button. */
+.file-btn input {
+  position: absolute;
+  inset: 0;
+  inline-size: 100%;
+  block-size: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.file-btn:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.file-btn.is-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.file-btn.is-disabled input {
+  cursor: not-allowed;
+}
+
+.scan-frames {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding-block-end: 2px;
+}
+
+.scan-frames img {
+  flex: none;
+  inline-size: 64px;
+  block-size: 64px;
+  border-radius: 10px;
+  object-fit: cover;
+  background: var(--sunken);
+}
+
+.scan-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  font-weight: 600;
+}
+
+.pulse {
+  flex: none;
+  inline-size: 12px;
+  block-size: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  50% {
+    transform: scale(0.6);
+    opacity: 0.5;
+  }
+}
+
+.scan-card {
+  display: grid;
+  gap: 14px;
+}
+
+.scan-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.scan-frame {
+  flex: none;
+  inline-size: min(45%, 180px);
+  aspect-ratio: 1;
+  border-radius: 16px;
+  object-fit: cover;
+  background: var(--sunken);
+}
+
+/* Counts read badly in the condensed display face. */
+.scan-total {
+  font: 700 var(--step-2) / 1.2 var(--font-body);
+}
+
+.scan-what {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+  min-width: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse {
+    animation: none;
+  }
+
+  .scan-card.enter {
+    animation: none;
+  }
+}
+
+.scan-card.enter {
+  animation: rise 0.24s ease-out;
+}
+
 /* ---- settings ---------------------------------------------------------------------------- */
 
 .panel {

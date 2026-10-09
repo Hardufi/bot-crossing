@@ -55,7 +55,8 @@ const ui = {
   receipt: null, // the "how much was it?" answers being typed: {key, vendorId, newVendor, amounts, units, error}
   receiptIds: null, // items just checked out, asked about in a sheet
   pricesKind: 'all',
-  scan: null, // the video update in progress: {step, source, frames, items, answers, index, ctl, error}
+  scan: null, // the video update in progress: {step, source, fromVideo, frames, notes, items, answers, index, kept, ctl, error}
+  vision: undefined, // the way to Claude for recognising products, once known: a source or null
   copyFallback: null, // {where: 'shop' | 'backup', text} when the clipboard refused
   enter: new Set(), // what animates in on the next render: 'card', 'sheet', 'toast'
   focus: null, // a selector to focus after the next render
@@ -258,6 +259,12 @@ function render() {
   // from the nearest heading, inside the sheet when one is open.
   if (!target && hadFocus) target = overlay ? (find('.sheet #add-q') ?? find('.sheet [tabindex="-1"]')) : (find('#q-name') ?? find('#f-name') ?? find('main h1'))
   target?.focus({ preventScroll: true })
+
+  // Bound to the inputs themselves, not delegated: if anything re-renders while the camera or
+  // the file picker is open, the choice still arrives, on the input that is now off the page.
+  for (const input of root.querySelectorAll('.sheet input[type="file"]')) {
+    input.onchange = () => input.files?.length && startScan([...input.files])
+  }
 }
 
 const openShopping = () => state.shopping.filter((s) => !s.done)
@@ -526,7 +533,38 @@ function savePriceEdit(d, id, draft, before) {
 
 // -- updating from a video ------------------------------------------------------------------
 
-const SCAN_FAIL = 'לא הצלחתי לפתוח את הקובץ בדפדפן הזה. אפשר לנסות סרטון אחר, או לבחור תמונות.'
+const SCAN_FAIL = { text: 'לא הצלחתי לפתוח את הקובץ בדפדפן הזה. אפשר לנסות סרטון אחר, או לבחור תמונות.' }
+// Photos chosen at once are read up to this many requests' worth.
+const PHOTO_BATCHES = 3
+
+// Whether this page can reach Claude: undefined until known, then a source or null.
+function refreshVision() {
+  return visionSource(deviceGet('apiKey')).then((source) => {
+    ui.vision = source
+    if (ui.scan?.step === 'pick') ui.scan.source = source
+    render()
+    return source
+  })
+}
+
+// The way in shows only where it leads somewhere: to Claude, or, in the app itself, to the
+// settings where an API key is added.
+const canScan = () => TOP_LEVEL || Boolean(ui.vision)
+
+const scanWhere = (sc) => (sc.fromVideo ? 'בסרטון' : 'בתמונות')
+const emptyScanText = (sc) => `לא זיהיתי ${scanWhere(sc)} פירות, ירקות או בשר. כדאי לצלם קרוב יותר ובאור טוב, פריט אחרי פריט.`
+
+// What goes to the pantry: what was confirmed from earlier videos and from this one, one entry
+// per product, counts added up.
+function scanChosen(sc) {
+  const merged = new Map()
+  for (const item of [...(sc.kept ?? []), ...(sc.items ?? []).filter((_, i) => sc.answers?.[i])]) {
+    const id = item.key ?? 'name:' + item.name
+    const prev = merged.get(id)
+    merged.set(id, prev ? { ...prev, count: (prev.count ?? 0) + (item.count ?? 0) || null } : item)
+  }
+  return [...merged.values()]
+}
 
 function scanSheet() {
   const sc = ui.scan
@@ -535,9 +573,9 @@ function scanSheet() {
       <h2 id="sheet-title" tabindex="-1">עדכון מהיר בסרטון</h2>
       <button class="icon-btn" data-act="close-sheet" aria-label="סגירה">${icon('close')}</button>
     </div>`
-  const strip = sc.frames?.length
-    ? `<div class="scan-frames" aria-hidden="true">${sc.frames.map((f) => `<img src="${esc(f.url)}" alt="">`).join('')}</div>`
-    : ''
+  const strip = `<div class="scan-frames" aria-hidden="true">${sc.frames.map((f) => `<img src="${esc(f.url)}" alt="">`).join('')}</div>`
+  const notes = sc.notes?.length ? `<p class="hint">${sc.notes.map(esc).join(' ')}</p>` : ''
+  const kept = sc.kept?.length ?? 0
   if (sc.step === 'pick') {
     const ready = Boolean(sc.source)
     const where =
@@ -552,6 +590,7 @@ function scanSheet() {
             : 'כמה תמונות מהסרטון נשלחות ל־Anthropic עם מפתח ה־API שלכם. הסרטון עצמו נשאר במכשיר.'
     return `${head}
       <p class="lede">מצלמים סרטון קצר של מה שקניתם, 5 עד 20 שניות, פריט אחרי פריט ובאור טוב. אזהה מה יש בו ואשאל על כל פריט: כן או לא.</p>
+      ${kept ? `<p class="banner">${kept === 1 ? 'פריט אחד שכבר אישרתם יתווסף' : `${kept} פריטים שכבר אישרתם יתווספו`} למלאי בסוף.</p>` : ''}
       <div class="scan-actions">
         <label class="btn btn-primary wide file-btn ${ready ? '' : 'is-disabled'}">${icon('camera')}צילום סרטון
           <input type="file" id="scan-video" accept="video/*" capture="environment" ${ready ? '' : 'disabled'}></label>
@@ -562,18 +601,25 @@ function scanSheet() {
       ${sc.source === null && TOP_LEVEL ? '<button class="btn" data-act="scan-settings">להגדרות</button>' : ''}`
   }
   if (sc.step === 'reading' || sc.step === 'thinking') {
+    // Not a live region: the steps are announced once each, not on every new frame.
     return `${head}
       ${strip}
-      <p class="scan-status" role="status"><span class="pulse" aria-hidden="true"></span>${sc.step === 'reading' ? 'מכין תמונות מהסרטון…' : 'מזהה מה יש בסרטון… זה לוקח בדרך כלל עד חצי דקה.'}</p>
+      <p class="scan-status"><span class="pulse" aria-hidden="true"></span>${sc.step === 'reading' ? (sc.fromVideo ? 'מכין תמונות מהסרטון…' : 'מכין את התמונות…') : `מזהה מה יש ${scanWhere(sc)}… זה לוקח בדרך כלל עד חצי דקה.`}</p>
+      ${notes}
       <button class="btn" data-act="scan-stop">עצירה</button>`
   }
   if (sc.step === 'error' || sc.step === 'empty') {
+    const err = sc.step === 'empty' ? { text: emptyScanText(sc) } : sc.error
     return `${head}
       ${strip}
-      <p class="form-error">${esc(sc.step === 'empty' ? 'לא זיהיתי בסרטון פירות, ירקות או בשר. כדאי לצלם קרוב יותר ובאור טוב, פריט אחרי פריט.' : sc.error)}</p>
+      <p class="form-error">${esc(err.text)}</p>
+      ${err.detail ? `<p class="hint scan-detail" dir="ltr" lang="en">${esc(err.detail)}</p>` : ''}
+      ${notes}
       <div class="btn-row">
-        ${sc.step === 'error' && sc.frames?.length ? '<button class="btn btn-primary" data-act="scan-retry">לנסות שוב</button>' : ''}
-        <button class="btn" data-act="scan-again">סרטון אחר</button>
+        ${err.retry && sc.frames.length ? '<button class="btn btn-primary" data-act="scan-retry">לנסות שוב</button>' : ''}
+        ${err.settings && TOP_LEVEL ? '<button class="btn btn-primary" data-act="scan-settings">להגדרות</button>' : ''}
+        ${err.permanent ? '' : `<button class="btn" data-act="scan-again">${sc.fromVideo ? 'סרטון אחר' : 'תמונות אחרות'}</button>`}
+        ${kept ? `<button class="btn" data-act="scan-apply">להוסיף למלאי את מה שאושר (${kept})</button>` : ''}
       </div>`
   }
   if (sc.step === 'confirm') {
@@ -601,16 +647,18 @@ function scanSheet() {
       </article>`
   }
   // summary
-  const chosen = sc.items.filter((_, i) => sc.answers[i])
+  const chosen = scanChosen(sc)
+  const n = chosen.length
   return `${head}
     <article class="scan-card ${ui.enter.has('card') ? 'enter' : ''}" aria-labelledby="scan-name">
-      <h3 class="qname scan-total" id="scan-name" tabindex="-1">${chosen.length ? `${countText(chosen.length, 'פריט אחד', 'פריטים')} למלאי` : 'לא נבחר אף פריט'}</h3>
-      ${chosen.length ? `<div class="chips">${chosen.map((i) => `<span class="chip">${tile(i, 'tile-sm')}${esc(i.name)}${i.count ? ` ×${i.count}` : ''}</span>`).join('')}</div>` : ''}
-      <p class="hint">${chosen.length ? 'ייכנסו למלאי כקנייה של היום. אחר כך אשאל איפה קניתם ובכמה.' : 'אפשר לחזור ולבחור, או לצלם שוב.'}</p>
+      <h3 class="qname scan-total" id="scan-name" tabindex="-1">${n ? `${countText(n, 'פריט אחד', 'פריטים')} למלאי` : 'לא נבחר אף פריט'}</h3>
+      ${n ? `<div class="chips">${chosen.map((i) => `<span class="chip">${tile(i, 'tile-sm')}${esc(i.name)}${i.count ? ` ×${i.count}` : ''}</span>`).join('')}</div>` : ''}
+      <p class="hint">${n ? `${n === 1 ? 'ייכנס' : 'ייכנסו'} למלאי כקנייה של היום. אחר כך אשאל איפה קניתם ובכמה.` : 'אפשר לחזור ולבחור, או לצלם שוב.'}</p>
+      ${notes}
       <div class="btn-row">
-        ${chosen.length ? '<button class="btn btn-primary" data-act="scan-apply">עדכון המלאי</button>' : ''}
+        ${n ? '<button class="btn btn-primary" data-act="scan-apply">עדכון המלאי</button>' : ''}
         <button class="btn" data-act="scan-back">חזרה</button>
-        <button class="btn" data-act="scan-again">סרטון נוסף</button>
+        <button class="btn" data-act="scan-again">צילום נוסף</button>
       </div>
     </article>`
 }
@@ -626,39 +674,54 @@ function endScan() {
   ui.scan = null
 }
 
+function scanFailed(sc, error) {
+  Object.assign(sc, error ? { step: 'error', error } : { step: 'empty', error: null })
+  render()
+  announce(error ? error.text : emptyScanText(sc), urgent)
+}
+
 async function startScan(files) {
   const sc = ui.scan
-  if (!sc?.source) return
+  if (!sc?.source || sc.step !== 'pick') return
   sc.ctl?.abort()
   dropFrames(sc)
   const ctl = new AbortController()
-  Object.assign(sc, { step: 'reading', ctl, error: null, items: [], answers: [], index: 0 })
+  const videos = files.filter((f) => f.type.startsWith('video/'))
+  const images = files.filter((f) => f.type.startsWith('image/'))
+  const video = videos[0]
+  const notes = []
+  if (video && images.length) notes.push('נבחרו גם סרטון וגם תמונות, והשתמשתי רק בסרטון.')
+  if (videos.length > 1) notes.push('נבחרו כמה סרטונים, והשתמשתי רק בראשון.')
+  Object.assign(sc, { step: 'reading', fromVideo: Boolean(video), notes, ctl, error: null, items: [], answers: [], index: 0 })
   render()
+  announce(video ? 'מכין תמונות מהסרטון' : 'מכין את התמונות')
   const options = {
-    count: sc.source.maxImages,
+    count: video ? sc.source.maxImages : sc.source.maxImages * PHOTO_BATCHES,
     signal: ctl.signal,
     onFrame(blob) {
       if (ui.scan !== sc || ctl.signal.aborted) return
-      sc.frames.push({ blob, url: URL.createObjectURL(blob) })
-      render()
+      const url = URL.createObjectURL(blob)
+      sc.frames.push({ blob, url })
+      // Added in place: rebuilding the sheet for every frame is work for nothing.
+      document.querySelector('.sheet .scan-frames')?.insertAdjacentHTML('beforeend', `<img src="${esc(url)}" alt="">`)
     },
   }
   try {
-    const video = files.find((f) => f.type.startsWith('video/'))
-    const images = files.filter((f) => f.type.startsWith('image/'))
     if (video) await framesFromVideo(video, options)
-    else await framesFromImages(images, options)
+    else {
+      const { skipped } = await framesFromImages(images, options)
+      const left = images.length - sc.frames.length - skipped
+      if (skipped) notes.push(skipped === 1 ? 'תמונה אחת לא נפתחה בדפדפן הזה, ודילגתי עליה.' : `${skipped} תמונות לא נפתחו בדפדפן הזה, ודילגתי עליהן.`)
+      if (left > 0) notes.push(`${left === 1 ? 'תמונה אחת נשארה' : `${left} תמונות נשארו`} בחוץ: אפשר עד ${options.count} תמונות בכל פעם.`)
+    }
   } catch (e) {
-    if (ui.scan !== sc) return
-    if (e?.code === 'cancelled') return
-    Object.assign(sc, { step: 'error', error: SCAN_FAIL })
-    render()
+    if (ui.scan !== sc || ctl.signal.aborted || e?.code === 'cancelled') return
+    scanFailed(sc, SCAN_FAIL)
     return
   }
   if (ui.scan !== sc || ctl.signal.aborted) return
   if (!sc.frames.length) {
-    Object.assign(sc, { step: 'error', error: SCAN_FAIL })
-    render()
+    scanFailed(sc, SCAN_FAIL)
     return
   }
   identify(sc, ctl)
@@ -667,16 +730,26 @@ async function startScan(files) {
 async function identify(sc, ctl = new AbortController()) {
   Object.assign(sc, { step: 'thinking', ctl, error: null })
   render()
+  announce([`מזהה מה יש ${scanWhere(sc)}`, ...(sc.notes ?? [])].join('. '))
+  let items
   try {
-    const items = await recognize(sc.source, sc.frames.map((f) => f.blob), { signal: ctl.signal })
-    if (ui.scan !== sc || ctl.signal.aborted) return
-    Object.assign(sc, { items, answers: items.map(() => null), index: 0, step: items.length ? 'confirm' : 'empty' })
-    ui.enter.add('card')
-    ui.focus = items.length ? '#scan-name' : null
+    items = await recognize(sc.source, sc.frames.map((f) => f.blob), { signal: ctl.signal })
   } catch (e) {
-    if (ui.scan !== sc || e?.code === 'cancelled') return
-    Object.assign(sc, { step: 'error', error: e instanceof VisionError ? e.message : 'הזיהוי נכשל. אפשר לנסות שוב.' })
+    // Stopped, or the sheet was closed: whatever the request ended with no longer matters.
+    if (ui.scan !== sc || ctl.signal.aborted || e?.code === 'cancelled') return
+    const err = e instanceof VisionError ? e : new VisionError('failed', e)
+    scanFailed(sc, { text: err.message, detail: err.detail, retry: err.retry, settings: err.settings, permanent: err.permanent })
+    if (err.permanent) refreshVision()
+    return
   }
+  if (ui.scan !== sc || ctl.signal.aborted) return
+  if (!items.length) {
+    scanFailed(sc, null)
+    return
+  }
+  Object.assign(sc, { items, answers: items.map(() => null), index: 0, step: 'confirm' })
+  ui.enter.add('card')
+  ui.focus = '#scan-name'
   render()
 }
 
@@ -685,8 +758,8 @@ function emptyStart() {
     <section class="empty">
       <h1 class="empty-title" tabindex="-1">מה יש בבית?</h1>
       <p class="lede">מוסיפים את הפירות, הירקות והבשר שקניתם. אשאל כמה הם עלו ואיפה, וכשמגיע הזמן אם הם עדיין בתוקף. מה שנגמר או התקלקל יעבור לרשימת הקניות.</p>
-      <button class="btn btn-primary wide scan-cta" data-act="scan-open">${icon('camera')}צילום סרטון של הקניות</button>
-      <h2 class="section-label">או הוספה מהירה</h2>
+      ${canScan() ? `<button class="btn btn-primary wide scan-cta" data-act="scan-open">${icon('camera')}צילום סרטון של הקניות</button>` : ''}
+      <h2 class="section-label">${canScan() ? 'או הוספה מהירה' : 'הוספה מהירה'}</h2>
       <div class="pick-grid">${STAPLES.map((k) => pickTile(byKey(k), 'pantry')).join('')}</div>
       <div class="btn-row">
         <button class="btn btn-primary" data-act="open-add" data-mode="pantry">${icon('plus')}פריטים נוספים</button>
@@ -747,7 +820,7 @@ function viewPantry() {
         <p class="view-sub">${items.length ? `${countText(items.length, 'פריט אחד', 'פריטים')}${first.length ? ` · ${first.length} לאכול קודם` : ''}` : 'ריק כרגע'}</p>
       </div>
       <div class="btn-row">
-        <button class="btn" data-act="scan-open">${icon('camera')}בסרטון</button>
+        ${canScan() ? `<button class="btn" data-act="scan-open">${icon('camera')}בסרטון</button>` : ''}
         <button class="btn btn-primary" data-act="open-add" data-mode="pantry">${icon('plus')}הוספה</button>
       </div>
     </div>
@@ -1109,7 +1182,7 @@ function addSheet() {
       <h2 id="sheet-title" tabindex="-1">${mode === 'shop' ? 'הוספה לרשימת הקניות' : 'הוספה למלאי'}</h2>
       <button class="icon-btn" data-act="close-sheet" aria-label="סגירה">${icon('close')}</button>
     </div>
-    ${mode === 'pantry' ? `<button class="btn wide" data-act="scan-open">${icon('camera')}צילום סרטון של הקניות</button>` : ''}
+    ${mode === 'pantry' && canScan() ? `<button class="btn wide" data-act="scan-open">${icon('camera')}צילום סרטון של הקניות</button>` : ''}
     <input class="search" id="add-q" type="text" inputmode="search" maxlength="60" placeholder="חיפוש, או שם של משהו אחר" value="${esc(query)}" autocomplete="off" enterkeyhint="done">
     <div class="seg" role="group" aria-label="סינון">
       ${[
@@ -1415,35 +1488,35 @@ const actions = {
     ui.toast = null
     ui.opener = focusSelector(el)
     endScan()
-    const sc = { step: 'pick', source: undefined, frames: [] }
-    ui.scan = sc
+    ui.scan = { step: 'pick', source: ui.vision, frames: [], kept: [] }
     ui.sheet = { type: 'scan' }
     ui.enter.add('sheet')
     render()
-    visionSource(deviceGet('apiKey')).then((source) => {
-      if (ui.scan !== sc) return
-      sc.source = source
-      render()
-    })
+    // Checked again each time: a key may have been added, or consent declined, since.
+    refreshVision()
   },
 
   'scan-stop'() {
     const sc = ui.scan
-    sc?.ctl?.abort()
+    if (!sc) return
+    sc.ctl?.abort()
     dropFrames(sc)
-    if (sc) sc.step = 'pick'
+    Object.assign(sc, { step: 'pick', notes: [] })
     render()
+    announce('נעצר')
   },
 
   'scan-retry'() {
-    if (ui.scan?.frames?.length) identify(ui.scan)
+    if (ui.scan?.step === 'error' && ui.scan.frames.length) identify(ui.scan)
   },
 
+  // Another video or more photos: what was confirmed so far waits for the end.
   'scan-again'() {
     const sc = ui.scan
-    sc?.ctl?.abort()
+    if (!sc) return
+    sc.ctl?.abort()
     dropFrames(sc)
-    if (sc) sc.step = 'pick'
+    Object.assign(sc, { kept: scanChosen(sc), items: [], answers: [], index: 0, notes: [], step: 'pick' })
     render()
   },
 
@@ -1469,8 +1542,7 @@ const actions = {
   },
 
   'scan-apply'() {
-    const sc = ui.scan
-    const chosen = (sc?.items ?? []).filter((_, i) => sc.answers[i])
+    const chosen = ui.scan ? scanChosen(ui.scan) : []
     if (!chosen.length) return
     closeSheet()
     ui.enter.add('card')
@@ -1494,6 +1566,7 @@ const actions = {
     deviceSet('apiKey', null)
     showToast('המפתח נמחק מהדפדפן הזה')
     render()
+    refreshVision()
   },
 
   'receipt-vendor'(el) {
@@ -1737,7 +1810,6 @@ root.addEventListener('change', async (e) => {
     announce(`התזכורת תהיה ב־${t.value}`)
   }
   if (t.id === 'add-freezer' && ui.sheet?.type === 'add') ui.sheet.freezer = t.checked
-  if ((t.id === 'scan-video' || t.id === 'scan-files') && t.files?.length) startScan([...t.files])
   if (t.id === 'notify') {
     if (t.checked && Notification.permission !== 'granted') {
       const p = await Notification.requestPermission().catch(() => 'denied')
@@ -1790,6 +1862,7 @@ root.addEventListener('submit', (e) => {
     deviceSet('apiKey', key)
     showToast('המפתח נשמר בדפדפן הזה')
     render()
+    refreshVision()
   }
   if (form === 'vendor-add') {
     const name = document.getElementById('v-new')?.value.trim()
@@ -1884,3 +1957,4 @@ if (TOP_LEVEL && 'serviceWorker' in navigator && location.protocol.startsWith('h
 }
 
 render()
+refreshVision()

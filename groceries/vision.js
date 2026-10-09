@@ -92,37 +92,44 @@ export function cleanDetections(raw, frameCount) {
   return [...seen.values()].sort((a, b) => b.confidence - a.confidence)
 }
 
-// Plain-language reasons, by what the user can do about each.
-const MESSAGES = {
-  not_granted: 'אין הרשאה להשתמש ב־Claude מהדף הזה. אפשר לאשר את זה בפעם הבאה שהדף שואל.',
-  sampling_disabled: 'Claude לא זמין לחשבון הזה.',
-  images_unavailable: 'שליחת תמונות ל־Claude לא זמינה כאן.',
-  image_rejected: 'התמונות מהסרטון לא התקבלו. אפשר לנסות סרטון אחר, או תמונות.',
-  rate_limited: 'יותר מדי בקשות כרגע. אפשר לנסות שוב בעוד כמה דקות.',
-  session_expired: 'צריך להתחבר מחדש ל־Claude.',
-  refused: 'הבקשה לא אושרה. אפשר לנסות סרטון אחר.',
-  invalid_json: 'התשובה לא הייתה מובנת. אפשר לנסות שוב.',
-  empty_completion: 'לא התקבלה תשובה. אפשר לנסות שוב.',
-  auth: 'מפתח ה־API לא התקבל. בודקים אותו בהגדרות.',
-  permission: 'למפתח ה־API הזה אין הרשאה להשתמש במודל.',
-  connection: 'אין חיבור ל־Anthropic. בודקים את האינטרנט ומנסים שוב.',
-  overloaded: 'השירות עמוס כרגע. אפשר לנסות שוב בעוד רגע.',
-  too_long: 'הסרטון ארוך מדי לזיהוי אחד. אפשר לצלם סרטון קצר יותר.',
-  failed: 'הזיהוי נכשל. אפשר לנסות שוב.',
+// Plain-language reasons, and what the user can do about each: `retry` the same frames,
+// fix the API key in `settings`, or nothing in this view (`permanent`).
+const ERRORS = {
+  not_granted: { text: 'לא אושר שימוש ב־Claude מהדף הזה. כדי לאשר, פותחים את הדף מחדש.', permanent: true },
+  sampling_disabled: { text: 'Claude לא זמין לחשבון הזה.', permanent: true },
+  images_unavailable: { text: 'שליחת תמונות ל־Claude לא זמינה כאן.', permanent: true },
+  unavailable: { text: 'הזיהוי לא זמין כאן.', permanent: true },
+  session_expired: { text: 'צריך להתחבר מחדש ל־Claude, ואז לפתוח את הדף מחדש.', permanent: true },
+  image_rejected: { text: 'התמונות לא התקבלו. אפשר לנסות סרטון אחר, או תמונות.' },
+  refused: { text: 'הבקשה לא אושרה. אפשר לנסות סרטון או תמונות אחרים.' },
+  empty_completion: { text: 'לא התקבלה תשובה. אפשר לנסות סרטון או תמונות אחרים.' },
+  rate_limited: { text: 'יותר מדי בקשות כרגע. אפשר לנסות שוב בעוד כמה דקות.', retry: true },
+  invalid_json: { text: 'התשובה לא הייתה מובנת. אפשר לנסות שוב.', retry: true },
+  connection: { text: 'אין חיבור ל־Anthropic. בודקים את האינטרנט ומנסים שוב.', retry: true },
+  overloaded: { text: 'השירות עמוס כרגע. אפשר לנסות שוב בעוד רגע.', retry: true },
+  too_long: { text: 'הזיהוי נקטע באמצע. אפשר לנסות שוב, או לצלם פחות מוצרים בכל פעם.', retry: true },
+  failed: { text: 'הזיהוי נכשל. אפשר לנסות שוב.', retry: true },
+  auth: { text: 'מפתח ה־API לא התקבל. בודקים אותו בהגדרות.', settings: true },
+  permission: { text: 'למפתח ה־API הזה אין גישה למודל. בודקים את החשבון בקונסולה של Anthropic.', settings: true },
+  bad_request: { text: 'Anthropic לא קיבלו את הבקשה. לרוב זה כי אין קרדיט בחשבון ה־API. בודקים בקונסולה של Anthropic, בעמוד Billing.', settings: true },
 }
+const SAMPLE_CODES = { not_declared: 'unavailable', capability_disabled: 'unavailable', capability_removed: 'unavailable', upstream_error: 'failed' }
 
 export class VisionError extends Error {
-  constructor(code, cause) {
-    super(MESSAGES[code] ?? MESSAGES.failed)
-    this.code = MESSAGES[code] ? code : 'failed'
-    this.cause = cause
+  constructor(code, cause, detail = '') {
+    const known = Object.hasOwn(ERRORS, code) ? code : 'failed'
+    super(ERRORS[known].text)
+    Object.assign(this, { code: known, cause, detail, retry: Boolean(ERRORS[known].retry), settings: Boolean(ERRORS[known].settings), permanent: Boolean(ERRORS[known].permanent) })
   }
 }
+
+// After a permanent refusal (no consent, sampling off) the claude.ai route is closed for the view.
+let sampleBlocked = false
 
 // Which way to Claude this page has, if any: {kind, maxImages} or null.
 export async function visionSource(apiKey) {
   const claude = typeof window !== 'undefined' ? window.claude : undefined
-  if (claude?.use) {
+  if (claude?.use && !sampleBlocked) {
     try {
       const sample = await claude.use('sample')
       const limits = sample ? await sample.limits().catch(() => null) : null
@@ -133,9 +140,18 @@ export async function visionSource(apiKey) {
   return null
 }
 
+// More photos than one request may carry are sent in batches; the answers are merged, with each
+// frame number moved back to its place in the whole set.
 export async function recognize(source, frames, { signal } = {}) {
-  const raw = source.kind === 'claude' ? await viaSample(source.sample, frames, signal) : await viaApi(source.apiKey, frames, signal)
-  return cleanDetections(raw, frames.length)
+  const raw = []
+  for (let start = 0; start < frames.length; start += source.maxImages) {
+    const batch = frames.slice(start, start + source.maxImages)
+    const reply = source.kind === 'claude' ? await viaSample(source.sample, batch, signal) : await viaApi(source.apiKey, batch, signal)
+    for (const item of Array.isArray(reply?.items) ? reply.items : []) {
+      if (item && typeof item === 'object') raw.push({ ...item, frame: Number.isInteger(item.frame) && item.frame >= 0 && item.frame < batch.length ? item.frame + start : start })
+    }
+  }
+  return cleanDetections({ items: raw }, frames.length)
 }
 
 async function viaSample(sample, frames, signal) {
@@ -143,7 +159,9 @@ async function viaSample(sample, frames, signal) {
     return await sample.json(buildPrompt(frames.length), { images: frames, signal, modelTier: 'default' })
   } catch (e) {
     if (e?.code === 'cancelled') throw e
-    throw new VisionError(e?.code, e)
+    const err = new VisionError(SAMPLE_CODES[e?.code] ?? e?.code, e)
+    if (err.permanent) sampleBlocked = true
+    throw err
   }
 }
 
@@ -155,14 +173,17 @@ async function toBase64(blob) {
 }
 
 let sdk = null
+let sdkFailures = 0
 
 async function viaApi(apiKey, frames, signal) {
   let Anthropic
   try {
-    sdk ??= import(/* @vite-ignore */ SDK_URL)
+    // A failed module import is remembered by the browser for that URL: retry on a fresh one.
+    sdk ??= import(/* @vite-ignore */ SDK_URL + (sdkFailures ? `?retry=${sdkFailures}` : ''))
     Anthropic = (await sdk).default
   } catch (e) {
     sdk = null
+    sdkFailures++
     throw new VisionError('connection', e)
   }
   // The key belongs to the person using this page, on their own device.
@@ -187,13 +208,14 @@ async function viaApi(apiKey, frames, signal) {
     )
   } catch (e) {
     if (e instanceof Anthropic.APIUserAbortError || signal?.aborted) throw { code: 'cancelled' }
-    if (e instanceof Anthropic.AuthenticationError) throw new VisionError('auth', e)
-    if (e instanceof Anthropic.PermissionDeniedError) throw new VisionError('permission', e)
-    if (e instanceof Anthropic.RateLimitError) throw new VisionError('rate_limited', e)
-    if (e instanceof Anthropic.BadRequestError) throw new VisionError('image_rejected', e)
+    const detail = String(e?.error?.error?.message ?? '').slice(0, 200)
+    if (e instanceof Anthropic.AuthenticationError) throw new VisionError('auth', e, detail)
+    if (e instanceof Anthropic.PermissionDeniedError || e instanceof Anthropic.NotFoundError) throw new VisionError('permission', e, detail)
+    if (e instanceof Anthropic.RateLimitError) throw new VisionError('rate_limited', e, detail)
+    if (e instanceof Anthropic.BadRequestError) throw new VisionError('bad_request', e, detail)
     if (e instanceof Anthropic.APIConnectionError) throw new VisionError('connection', e)
-    if (e instanceof Anthropic.InternalServerError) throw new VisionError('overloaded', e)
-    throw new VisionError('failed', e)
+    if (e instanceof Anthropic.InternalServerError) throw new VisionError('overloaded', e, detail)
+    throw new VisionError('failed', e, detail)
   }
   if (response.stop_reason === 'refusal') throw new VisionError('refused')
   if (response.stop_reason === 'max_tokens') throw new VisionError('too_long')

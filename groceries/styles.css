@@ -1333,11 +1333,15 @@ button {
   cursor: not-allowed;
 }
 
+/* Wraps rather than scrolls: a scrolling strip would be a silent stop for the Tab key. */
 .scan-frames {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
-  overflow-x: auto;
-  padding-block-end: 2px;
+}
+
+.scan-frames:empty {
+  display: none;
 }
 
 .scan-frames img {
@@ -1399,24 +1403,33 @@ button {
 }
 
 .scan-what {
+  flex: 1 1 auto;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 6px;
   justify-items: start;
   min-width: 0;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .pulse {
-    animation: none;
-  }
+.scan-what .qname {
+  overflow-wrap: anywhere;
+}
 
-  .scan-card.enter {
-    animation: none;
-  }
+/* What the API said, in its own words, for anyone checking their account. */
+.scan-detail {
+  overflow-wrap: anywhere;
+  text-align: start;
 }
 
 .scan-card.enter {
   animation: rise 0.24s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse,
+  .scan-card.enter {
+    animation: none;
+  }
 }
 
 /* ---- settings ---------------------------------------------------------------------------- */
